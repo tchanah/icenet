@@ -620,3 +620,95 @@ object SimNetwork {
     }
   }
 }
+
+object PacketModifierConnector {
+
+  /**
+   * Connects the NIC output through a PacketModifier instance back to the NIC input.
+   * Attempts to mimic NicLoopback structure by using a Pipe on the output path.
+   *
+   * @param netio The NICIOvonly bundle from the harness perspective.
+   * @param params The parameters associated with the NIC port (expected to be NICConfig).
+   * @param p Implicit CDE Parameters context.
+   */
+  def connect(netio: NICIOvonly, params: Any)(implicit p: Parameters): Unit = {
+    println("[PacketModifierConnector] Connecting NIC through PacketModifier (Queue Input + Pipe Output approach)")
+
+    // 1. Extract NICConfig and Instantiate PacketModifier
+    val nicConf = params match {
+      case conf: NICConfig => conf
+      case _ => throw new Exception(s"PacketModifierConnector requires NICConfig params, got ${params.getClass.getName}")
+    }
+    // Use latency similar to NicLoopback default
+    val latency = 10
+    // Ensure you are using the simplified pass-through PacketModifier for this test
+    val modifier = Module(new PacketModifier(NET_IF_WIDTH))
+    println(s"[PacketModifierConnector] Instantiated PacketModifier with dataWidth=${NET_IF_WIDTH}")
+    println(s"[PacketModifierConnector] Using latency = ${latency} for output Pipe")
+
+    // 2. Setup NIC Control Signals (adapted from NicLoopback)
+    import PauseConsts._ // Use this if PauseConsts is properly on the classpath
+    val packetWords = nicConf.packetMaxBytes / NET_IF_BYTES
+    val packetQuanta = if (BT_PER_QUANTA > 0) {
+                         (nicConf.packetMaxBytes * 8) / BT_PER_QUANTA
+                       } else {
+                         println("[PacketModifierConnector] Warning: BT_PER_QUANTA is zero, defaulting packetQuanta to 0")
+                         0
+                       }
+    // Ensure PlusArg has access to chisel3.util functions or specify width explicitly
+    netio.macAddr := PlusArg("macaddr", width = 48)
+    netio.rlimit.inc := PlusArg("rlimit-inc", 1, width = 32)
+    netio.rlimit.period := PlusArg("rlimit-period", 1, width = 32)
+    netio.rlimit.size := PlusArg("rlimit-size", 8, width = 32)
+    // Use latency value in threshold calculation like NicLoopback
+    netio.pauser.threshold := PlusArg("pauser-threshold", 2 * packetWords + latency, width = 32)
+    netio.pauser.quanta := PlusArg("pauser-quanta", 2 * packetQuanta, width = 32)
+    netio.pauser.refresh := PlusArg("pauser-refresh", packetWords, width = 32)
+    println(s"[PacketModifierConnector] Configured NIC PlusArgs: macaddr, rlimit-*, pauser-*")
+    // Check the usePauser flag value during elaboration
+    println(s"[PacketModifierConnector] NICConfig usePauser = ${nicConf.usePauser}")
+
+
+    // --- Connect Data Path: Queue for Input, Pipe for Output ---
+
+    // 1. Adapt NIC output (Valid) -> Modifier input (Decoupled) using Queue
+    // This part remains necessary because modifier.io.in is Decoupled.
+    val inAdapterQueue = Module(new Queue(chiselTypeOf(netio.out.bits), entries = 2)) // Small queue is likely sufficient
+    inAdapterQueue.io.enq.valid := netio.out.valid
+    inAdapterQueue.io.enq.bits  := netio.out.bits
+    // Connect Queue output (Decoupled) to modifier input (Decoupled)
+    modifier.io.in <> inAdapterQueue.io.deq
+    println("[PacketModifierConnector] Connected netio.out -> inAdapterQueue -> modifier.io.in")
+
+
+    // Check if we should mimic the Pauser path - NicLoopback uses PauserComplex here if true.
+    // This implementation currently *ignores* usePauser and implements the non-pauser Pipe path.
+    // If usePauser is true, this configuration will differ significantly from NicLoopback.
+    if (nicConf.usePauser) {
+      println("[PacketModifierConnector] WARNING: usePauser is true. This connector currently implements the non-pauser Pipe path. Behavior WILL differ from NicLoopback if usePauser=true.")
+    }
+
+
+    // 2. Adapt Modifier output (Decoupled) -> NIC input (Valid) using Pipe
+    // Instantiate the Pipe MODULE. It takes DecoupledIO (enq) and produces DecoupledIO (deq).
+    val outQueuePipe = Module(new Queue(chiselTypeOf(modifier.io.out.bits), entries = 1, pipe = true))
+    println(s"[PacketModifierConnector] Using Queue(entries=1, pipe=true) for output stage.")
+
+    // Connect modifier output (Decoupled) to Pipe input (Decoupled)
+    outQueuePipe.io.enq <> modifier.io.out
+    println("[PacketModifierConnector] Connected modifier.io.out -> outQueuePipe.io.enq")
+
+    // Connect Pipe output (Decoupled) to NIC input (Valid)
+    netio.in.valid := outQueuePipe.io.deq.valid
+    netio.in.bits  := outQueuePipe.io.deq.bits
+    // Tell the Pipe's output that the ValidIO sink (netio.in) is always ready to accept.
+    outQueuePipe.io.deq.ready := true.B
+    println("[PacketModifierConnector] Connected outQueuePipe.io.deq -> netio.in")
+
+    // Force keep bits (Keep this, as NicLoopback does it)
+    netio.in.bits.keep := NET_FULL_KEEP
+    println("[PacketModifierConnector] Forcing netio.in.bits.keep = NET_FULL_KEEP")
+
+    println("[PacketModifierConnector] Data path connection complete.")
+  }
+}
