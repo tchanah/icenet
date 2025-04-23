@@ -15,6 +15,9 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 
+#include <cstdio>    // For perror, stderr, fprintf
+#include <cinttypes> // For PRIx64 macro
+
 static int tuntap_alloc(const char *dev, int flags)
 {
 	struct ifreq ifr;
