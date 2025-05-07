@@ -11,6 +11,9 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import IceNetConsts._
 
+// Custom imports for collective
+import icenet.collective._
+
 // This is copied from testchipip to avoid dependencies
 class ClockedIO[T <: Data](private val gen: T) extends Bundle {
   val clock = Output(Clock())
@@ -710,5 +713,114 @@ object PacketModifierConnector {
     println("[PacketModifierConnector] Forcing netio.in.bits.keep = NET_FULL_KEEP")
 
     println("[PacketModifierConnector] Data path connection complete.")
+  }
+}
+
+object RecursiveDoublingConnector {
+
+  /**
+   * Connects the NIC output through a RecursiveDoubling instance back to the NIC input.
+   * Uses Queues to adapt between ValidIO (NIC) and DecoupledIO (RecursiveDoubling module).
+   *
+   * @param netio The NICIOvonly bundle from the harness perspective.
+   * @param nicConf The parameters associated with the NIC port (NICConfig object).
+   * Changed from Any to NICConfig for type safety, assuming it's always passed.
+   * @param p Implicit CDE Parameters context, used to fetch RecursiveDoublingParams.
+   */
+  def connect(netio: NICIOvonly, nicConf: NICConfig)(implicit p: Parameters): Unit = {
+    println("[RecursiveDoublingConnector] Connecting NIC through RecursiveDoubling (Queue Input + Pipe Output approach)")
+
+    // 1. Lookup RecursiveDoublingParams from CDE config and Instantiate Module
+    // *** CHANGED: Lookup parameters using the key ***
+    val rdParams = p.lift(RecursiveDoublingKey).flatten.getOrElse(
+      throw new Exception("RecursiveDoublingParams not found. Did you add WithRecursiveDoubling to your Config?")
+    )
+    // *** CHANGED: Instantiate RecursiveDoubling with looked-up parameters ***
+    val recursiveDoubler = Module(new RecursiveDoubling(rdParams))
+    // Use dataWidth from the specific parameters for consistency
+    println(s"[RecursiveDoublingConnector] Instantiated RecursiveDoubling with dataWidth=${rdParams.dataWidth}")
+
+
+    // 2. Setup NIC Control Signals (PlusArgs for simulation)
+    // --- NO CHANGES EXPECTED HERE --- (This configures the NIC itself)
+    val latency = 10 // Keeping latency consistent with the previous example for pauser calculation
+    println(s"[RecursiveDoublingConnector] Using latency = ${latency} for pauser threshold calculation hint")
+    
+    import PauseConsts._
+    val packetWords = nicConf.packetMaxBytes / NET_IF_BYTES
+    val packetQuanta = if (BT_PER_QUANTA > 0) {
+                         (nicConf.packetMaxBytes * 8) / BT_PER_QUANTA
+                       } else {
+                         println("[RecursiveDoublingConnector] Warning: BT_PER_QUANTA is zero, defaulting packetQuanta to 0")
+                         0
+                       }
+    // Ensure PlusArg has access to chisel3.util functions or specify width explicitly if needed outside harness
+    netio.macAddr := PlusArg("macaddr", width = 48)
+    netio.rlimit.inc := PlusArg("rlimit-inc", 1, width = 32)
+    netio.rlimit.period := PlusArg("rlimit-period", 1, width = 32)
+    netio.rlimit.size := PlusArg("rlimit-size", 8, width = 32)
+    // Use latency value in threshold calculation like NicLoopback
+    netio.pauser.threshold := PlusArg("pauser-threshold", 2 * packetWords + latency, width = 32)
+    netio.pauser.quanta := PlusArg("pauser-quanta", 2 * packetQuanta, width = 32)
+    netio.pauser.refresh := PlusArg("pauser-refresh", packetWords, width = 32)
+    println(s"[RecursiveDoublingConnector] Configured NIC PlusArgs: macaddr, rlimit-*, pauser-*")
+    println(s"[RecursiveDoublingConnector] NICConfig usePauser = ${nicConf.usePauser}")
+
+
+    // --- Connect Data Path: Queue for Input, Pipe for Output ---
+
+    // 3. Adapt NIC output (Valid) -> Module input (Decoupled) using Queue
+    // --- NO STRUCTURAL CHANGES HERE, just variable names ---
+    // Interface types match (StreamChannel), so Queue is appropriate.
+    // *** CHANGED: Connect to recursiveDoubler.io.in ***
+    val inAdapterQueue = Module(new Queue(chiselTypeOf(netio.out.bits), entries = 2))
+    //inAdapterQueue.io.enq <> netio.out // Directly connect ValidIO output to Queue enqueue input
+    inAdapterQueue.io.enq.valid := netio.out.valid
+    inAdapterQueue.io.enq.bits  := netio.out.bits
+
+    recursiveDoubler.io.in <> inAdapterQueue.io.deq // Connect Queue output to Module input
+    // *** CHANGED: Updated print statement ***
+    println("[RecursiveDoublingConnector] Connected netio.out -> inAdapterQueue -> recursiveDoubler.io.in")
+
+
+    // 4. Handle Pauser Warning (Logic identical to PacketModifierConnector)
+    // --- NO CHANGES HERE ---
+    if (nicConf.usePauser) {
+      println("[RecursiveDoublingConnector] WARNING: usePauser is true. This connector currently implements the non-pauser Pipe path. Behavior WILL differ from NicLoopback if usePauser=true.")
+    }
+
+
+    // 5. Adapt Module output (Decoupled) -> NIC input (Valid) using Pipe (Queue with pipe=true)
+    // --- NO STRUCTURAL CHANGES HERE, just variable names ---
+    // Interface types match, Pipe adapts Decoupled->Decoupled, then we connect to ValidIO.
+    // *** CHANGED: Connect from recursiveDoubler.io.out ***
+    val outQueuePipe = Module(new Queue(chiselTypeOf(recursiveDoubler.io.out.bits), entries = 1, pipe = true))
+    outQueuePipe.io.enq <> recursiveDoubler.io.out // Connect Module output to Pipe input
+    // *** CHANGED: Updated print statement ***
+    println(s"[RecursiveDoublingConnector] Using Queue(entries=1, pipe=true) for output stage.")
+    println("[RecursiveDoublingConnector] Connected recursiveDoubler.io.out -> outQueuePipe.io.enq")
+
+    // Connect Pipe output (Decoupled) to NIC input (Valid)
+    // This part converts Decoupled back to Valid
+    netio.in.valid := outQueuePipe.io.deq.valid
+    netio.in.bits  := outQueuePipe.io.deq.bits
+    outQueuePipe.io.deq.ready := true.B // Assume NIC's input can always accept when valid
+    // *** CHANGED: Updated print statement ***
+    println("[RecursiveDoublingConnector] Connected outQueuePipe.io.deq -> netio.in")
+
+
+    // 6. Force keep bits (Logic identical to PacketModifierConnector)
+    // --- NO CHANGES HERE ---
+    // Calculate full keep based on the module's configured dataWidth
+    //val fullKeep = ((1 << rdParams.bytesPerWord) - 1).U(rdParams.bytesPerWord.W)
+    //netio.in.bits.keep := fullKeep
+    // *** CHANGED: Updated print statement and use rdParams ***
+    netio.in.bits.keep := NET_FULL_KEEP
+    //println(s"[RecursiveDoublingConnector] Forcing netio.in.bits.keep = ${Hexadecimal(fullKeep)}")
+    println(s"[RecursiveDoublingConnector] Forcing netio.in.bits.keep = NET_FULL_KEEP")
+
+
+    // *** CHANGED: Updated final print statement ***
+    println("[RecursiveDoublingConnector] Data path connection complete.")
   }
 }
