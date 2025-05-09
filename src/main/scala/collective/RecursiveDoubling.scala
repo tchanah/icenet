@@ -50,9 +50,40 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
     val TOTAL_WORDS_PER_PACKET = params.totalWordsPerPacket
     val ELEMENT_WIDTH = params.elementWidth
 
+    // --- Data Buffers and Storage ---
+    // Temporary buffer for incoming data elements (bytes)
+    val incomingDataBuffer = Reg(Vec(NUM_DATA_ELEMENTS, UInt(ELEMENT_WIDTH.W)))
+    // Main storage registry: Levels x Elements
+    val storageRegistry = Reg(Vec(MAX_RECURSION_LEVEL, Vec(NUM_DATA_ELEMENTS, UInt(ELEMENT_WIDTH.W))))
+    // Track validity of each level in storage
+    val storageValid = RegInit(VecInit(Seq.fill(MAX_RECURSION_LEVEL)(false.B)))
+
+    // --- Packet Buffer ---
+    class PacketInfo extends Bundle {
+        val collectiveId = UInt(16.W)
+        val collectiveType = UInt(8.W)
+        val operation = UInt(8.W)
+        val maxLevel = UInt(8.W)
+        val data = Vec(NUM_DATA_ELEMENTS, UInt(ELEMENT_WIDTH.W))
+        val valid = Bool()
+    }
+    
+    // Buffer indexed by level (level 0 is never buffered)
+    val packetBuffer = RegInit(VecInit(Seq.fill(MAX_RECURSION_LEVEL - 1) {
+        val info = Wire(new PacketInfo)
+        info.collectiveId := 0.U
+        info.collectiveType := 0.U
+        info.operation := 0.U
+        info.maxLevel := 0.U
+        info.data := VecInit(Seq.fill(NUM_DATA_ELEMENTS)(0.U(ELEMENT_WIDTH.W)))
+        info.valid := false.B
+        info
+    }))
+
     // --- State Machine ---
-    val s_idle :: s_recv_data :: s_process :: s_send_meta :: s_send_data :: Nil = Enum(5)
+    val s_idle :: s_recv_data :: s_store_buffer :: s_process :: s_send_meta :: s_send_data :: s_check_buffer :: Nil = Enum(7)
     val state = RegInit(s_idle)
+    val prevState = RegInit(s_idle)
 
     // --- Metadata Registers ---
     // Stored when recv_meta completes
@@ -62,13 +93,6 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
     // Bytes 4, 5 are empty
     val maxLevelReg       = Reg(UInt(8.W)) // Store Max Level from packet
     val currentLevelReg   = Reg(UInt(8.W)) // Store Current Level from packet
-
-    // --- Data Buffers and Storage ---
-    // Temporary buffer for incoming data elements (bytes)
-    val incomingDataBuffer = Reg(Vec(NUM_DATA_ELEMENTS, UInt(ELEMENT_WIDTH.W)))
-    // Main storage registry: Levels x Elements
-    // Note: Using Vec of Regs for synthesis. Consider Mem for larger structures.
-    val storageRegistry = Reg(Vec(MAX_RECURSION_LEVEL, Vec(NUM_DATA_ELEMENTS, UInt(ELEMENT_WIDTH.W))))
 
     // --- Counters ---
     // Counts words received within a packet (metadata + data)
@@ -90,7 +114,7 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
     val incoming_valid = io.in.valid
     val incoming_fire = io.in.fire // Convenience wire: io.in.valid && io.in.ready
 
-    // --- Output Handling ---
+   // --- Output Handling ---
     val outgoing_bits = Wire(new StreamChannel(params.dataWidth))
 
     // Assign default values (e.g., 0 or DontCare) to ensure the wire is always driven.
@@ -100,9 +124,8 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
     outgoing_bits.last := false.B
     
     io.out.bits := outgoing_bits
-    io.out.valid := false.B // Default
+    io.out.valid := false.B 
 
-    // Default pass-through for unmodified metadata parts (can be overridden)
     // Assemble metadata fields into the first 8 bytes (64 bits)
     // Bytes: | 7(MSB) | 6     | 5 | 4 | 3      | 2      | 1    | 0(LSB)|
     // Field: | CurrLvl| MaxLvl| - | - | Op     | Type   | Coll ID     |
@@ -154,12 +177,33 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
             receivedWordCount := receivedWordCount + 1.U
 
             // Check if this is the last beat of the packet
-            // Assumes 'last' is asserted on the final data beat
             when(incoming_bits.last) {
-                state := s_process
-                receivedWordCount := 0.U // Reset for next packet
+                // Check if we can process this packet immediately
+                val canProcess = currentLevelReg === 0.U || 
+                               (currentLevelReg > 0.U && storageValid(currentLevelReg - 1.U))
+                
+                when(canProcess) {
+                    state := s_process
+                } .otherwise {
+                    // Transition to buffer storage state
+                    state := s_store_buffer
+                }
+                receivedWordCount := 0.U
             }
         }
+    }
+    .elsewhen(state === s_store_buffer) {
+        // Store packet in level-indexed buffer
+        val bufferIndex = currentLevelReg - 1.U
+        
+        packetBuffer(bufferIndex).collectiveId := collectiveIdReg
+        packetBuffer(bufferIndex).collectiveType := collectiveTypeReg
+        packetBuffer(bufferIndex).operation := operationReg
+        packetBuffer(bufferIndex).maxLevel := maxLevelReg
+        packetBuffer(bufferIndex).data := incomingDataBuffer
+        packetBuffer(bufferIndex).valid := true.B
+        
+        state := s_idle
     }
     .elsewhen(state === s_process) {
         // --- Combinational Processing Logic ---
@@ -168,9 +212,8 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
         when(currentLevelReg === 0.U) {
             // Base case: Level 0
             nextLevel := 1.U
-            useProcessedDataForOutput := false.B // Send incoming data directly
-            storeData := true.B                 // Store incoming data at level 0
-
+            useProcessedDataForOutput := false.B
+            storeData := true.B
         } .otherwise {
             // Recursive case: Level > 0
             nextLevel := currentLevelReg + 1.U
@@ -183,13 +226,6 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
                 // Assuming simple UInt addition (wraps on overflow)
                 processedData(i) := incomingDataBuffer(i) + prevLevelData(i)
             }
-
-            // Store result if not exceeding max level
-            // when(currentLevelReg < maxLevelReg) {
-            //     storeData := true.B
-            // } .otherwise {
-            //     storeData := false.B // Max level reached, only send
-            // }
         }
 
         // --- Transition to Sending ---
@@ -203,27 +239,25 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
         outgoing_bits.last := (NUM_DATA_WORDS == 0).B // Only last if there's no data payload
         outgoing_bits.keep := (~0.U((params.dataWidth / 8).W)) // Assume all bytes valid
 
-        // --- Storage Logic (triggered by storeData) ---
-        // This happens combinationally based on the decision above,
-        // the registers update at the clock edge when state transitions.
-        when(storeData) {
-            // Store either incoming data (Level 0) or processed data (Level > 0)
-            // at the current level index.
-            val dataToStore = Mux(currentLevelReg === 0.U, incomingDataBuffer, processedData)
-            when (currentLevelReg < MAX_RECURSION_LEVEL.U) { // Ensure we don't write out of bounds
-                storageRegistry(currentLevelReg) := dataToStore
-            }
-        }
-
         when(io.out.fire) {
+            // Storage logic moved here to be triggered by fire
+            when(storeData) {
+                // Store either incoming data (Level 0) or processed data (Level > 0)
+                val dataToStore = Mux(currentLevelReg === 0.U, incomingDataBuffer, processedData)
+                when (currentLevelReg < MAX_RECURSION_LEVEL.U) { // Ensure we don't write out of bounds
+                    storageRegistry(currentLevelReg) := dataToStore
+                    storageValid(currentLevelReg) := true.B
+                }
+            }
+            
             sentWordCount := 1.U
             if (NUM_DATA_WORDS > 0) {
                 state := s_send_data
             } else {
-                state := s_idle // No data words to send
+                // Remove storage reset from here
+                state := s_check_buffer
             }
         }
-
     }
     .elsewhen(state === s_send_data) {
         io.out.valid := true.B
@@ -234,6 +268,7 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
         // Assemble the data word to send
         val baseElementIndex = (sentWordCount - 1.U) * ELEMENTS_PER_WORD.U
         val dataWordVec = Wire(Vec(ELEMENTS_PER_WORD, UInt(ELEMENT_WIDTH.W)))
+        
         for (i <- 0 until ELEMENTS_PER_WORD) {
             when((baseElementIndex + i.U) < NUM_DATA_ELEMENTS.U) { // Bounds check
                 dataWordVec(i) := dataSource(baseElementIndex + i.U)
@@ -249,12 +284,39 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
         outgoing_bits.keep := (~0.U((params.dataWidth / 8).W)) // Assume all bytes valid
 
         when(io.out.fire) {
-            sentWordCount := sentWordCount + 1.U
             when(isLastDataWord) {
-                state := s_idle // Packet fully sent
-                sentWordCount := 0.U // Reset for next packet
+                // Reset storage when we're done with the final level
+                when(currentLevelReg === maxLevelReg) {
+                    storageValid.foreach(_ := false.B)
+                }
+                state := s_check_buffer
+                sentWordCount := 0.U
+            }.otherwise {
+                sentWordCount := sentWordCount + 1.U
             }
-            // else remain in s_send_data
+        }
+    }
+    .elsewhen(state === s_check_buffer) {
+        io.out.valid := false.B
+        
+        // Check the next level that could be processed
+        val nextLevel = currentLevelReg + 1.U
+        
+        when(nextLevel < MAX_RECURSION_LEVEL.U && packetBuffer(nextLevel - 1.U).valid) {
+            // Load packet data
+            collectiveIdReg := packetBuffer(nextLevel - 1.U).collectiveId
+            collectiveTypeReg := packetBuffer(nextLevel - 1.U).collectiveType
+            operationReg := packetBuffer(nextLevel - 1.U).operation
+            maxLevelReg := packetBuffer(nextLevel - 1.U).maxLevel
+            currentLevelReg := nextLevel
+            incomingDataBuffer := packetBuffer(nextLevel - 1.U).data
+            
+            // Mark buffer entry as invalid
+            packetBuffer(nextLevel - 1.U).valid := false.B
+            
+            state := s_process
+        } .otherwise {
+            state := s_idle
         }
     }
 
@@ -264,8 +326,10 @@ class RecursiveDoubling(params: RecursiveDoublingParams) extends Module {
     // For higher throughput, buffer status should be considered.
     io.in.ready := (state === s_idle || state === s_recv_data) && io.out.ready
 
-    // Alternative Input Ready (Decoupled from output, assumes enough buffer space)
-    // io.in.ready := (state === s_idle || state === s_recv_data)
+    // At the end of the always block (after all state transitions):
+    when(state =/= prevState) {
+      prevState := state
+    }
 }
 
 
