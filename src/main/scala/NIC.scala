@@ -10,6 +10,8 @@ import freechips.rocketchip.regmapper.{HasRegMap, RegField}
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import IceNetConsts._
+import freechips.rocketchip.tilelink.TLRAM
+import freechips.rocketchip.tilelink.TLXbar
 
 // Custom imports for collective
 import icenet.collective._
@@ -822,5 +824,126 @@ object RecursiveDoublingConnector {
 
     // *** CHANGED: Updated final print statement ***
     println("[RecursiveDoublingConnector] Data path connection complete.")
+  }
+}
+
+
+// #########################################################################################
+// Simple DMA Connector Logic
+// #########################################################################################
+
+// Create a wrapper LazyModule that contains a simple DMA implementation
+class SimpleDmaControllerWrapper(implicit p: Parameters) extends LazyModule {
+  // Create a simple memory system for DMA operations
+  val ram = LazyModule(new TLRAM(
+    address = AddressSet(0x80000000L, 0x10000000L - 1),
+    beatBytes = 8, // Use 8 bytes to match NET_IF_BYTES
+    devName = Some("simple-dma-controller-ram")
+  ))
+  
+  // Create a simple DMA controller that directly handles TileLink
+  val dmaController = LazyModule(new SimpleDmaController)
+  
+  // Connect DMA controller to RAM
+  ram.node := dmaController.node
+  
+  lazy val module = new SimpleDmaControllerWrapperModuleImp(this)
+}
+
+class SimpleDmaControllerWrapperModuleImp(outer: SimpleDmaControllerWrapper) extends LazyModuleImp(outer) {
+  val io = IO(new Bundle {
+    val net_in = Flipped(Decoupled(new StreamChannel(NET_IF_WIDTH)))
+    val net_out = Decoupled(new StreamChannel(NET_IF_WIDTH))
+  })
+  
+  val dmaControllerModule = outer.dmaController.module
+  // Instantiate the RAM module to activate TileLink connections
+  val _ = outer.ram.module
+  
+  // Connect network interface
+  io.net_in <> dmaControllerModule.io.net_in
+  io.net_out <> dmaControllerModule.io.net_out
+}
+
+object SimpleDmaControllerConnector {
+  def connect(netio: NICIOvonly, nicConf: NICConfig)(implicit p: Parameters): Unit = {
+    println("[SimpleDmaControllerConnector] Attaching Simple DMA Controller wrapper to the NIC.")
+
+    // Create the wrapper LazyModule that contains everything
+    val wrapper = LazyModule(new SimpleDmaControllerWrapper)
+    val wrapperModule = Module(wrapper.module)
+
+    // --- TARGETED PRINTS: Only print key events ---
+    val prev_nic_out_valid = RegNext(netio.out.valid)
+    val prev_nic_in_valid = RegNext(netio.in.valid)
+
+    // --- Step 3: Connect Data Path ---
+
+    // Connect the NIC output to the wrapper's network input.
+    // A simple Queue helps buffer the data.
+    val inQueue = Module(new Queue(chiselTypeOf(netio.out.bits), 2))
+    inQueue.io.enq.valid := netio.out.valid
+    inQueue.io.enq.bits  := netio.out.bits
+    wrapperModule.io.net_in <> inQueue.io.deq
+    println("[SimpleDmaControllerConnector] Connected netio.out -> inQueue -> wrapper.io.net_in")
+
+    // Connect the wrapper's network output to the NIC input.
+    // The wrapper's output is Decoupled, which can drive the NIC's ValidIO directly.
+    netio.in.valid := wrapperModule.io.net_out.valid
+    netio.in.bits  := wrapperModule.io.net_out.bits
+    wrapperModule.io.net_out.ready := true.B // Assume NIC input is always ready
+    println("[SimpleDmaControllerConnector] Connected wrapper.io.net_out -> netio.in")
+
+    // Force keep bits to all 1s
+    netio.in.bits.keep := NET_FULL_KEEP
+    println("[SimpleDmaControllerConnector] Forcing netio.in.bits.keep to all ones.")
+    
+    // --- TARGETED PRINTS: Only print key events ---
+    
+    // 1. NIC receives packet from C test (only when it happens)
+    when(netio.out.valid && !prev_nic_out_valid) {
+      printf("[SimpleDmaControllerConnector] NIC_RECV: data=0x%x, last=%d\n", 
+        netio.out.bits.data, netio.out.bits.last)
+    }
+
+    // 2. NIC sends packet to module (only when fired)
+    when(netio.out.valid && inQueue.io.enq.ready) {
+      printf("[SimpleDmaControllerConnector] NIC_TO_MODULE: data=0x%x, last=%d\n", 
+        netio.out.bits.data, netio.out.bits.last)
+    }
+    
+    // 3. NIC drops packet (only when it happens)
+    when(netio.out.valid && !inQueue.io.enq.ready && 
+         (netio.out.valid =/= prev_nic_out_valid || inQueue.io.enq.ready =/= RegNext(inQueue.io.enq.ready))) {
+      printf("[SimpleDmaControllerConnector] NIC_DROP: module not ready\n")
+    }
+
+    // 4. Module sends packet to NIC (only when fired)
+    when(wrapperModule.io.net_out.valid && wrapperModule.io.net_out.ready) {
+      printf("[SimpleDmaControllerConnector] MODULE_TO_NIC: data=0x%x, last=%d\n", 
+        wrapperModule.io.net_out.bits.data, wrapperModule.io.net_out.bits.last)
+    }
+
+    // --- NEW: Debug NIC receive from module ---
+    when(netio.in.valid && !prev_nic_in_valid) {
+      printf("[SimpleDmaControllerConnector] NIC_RECV_FROM_MODULE: data=0x%x, last=%d\n", 
+        netio.in.bits.data, netio.in.bits.last)
+    }
+
+    // Add standard PlusArg connections for simulation (same as RecursiveDoublingDMA)
+    netio.macAddr := PlusArg("macaddr", width = 48)
+    netio.rlimit.inc := PlusArg("rlimit-inc", 1, width = 32)
+    netio.rlimit.period := PlusArg("rlimit-period", 1, width = 32)
+    netio.rlimit.size := PlusArg("rlimit-size", 8, width = 32)
+    val latency = 10
+    val packetWords = nicConf.packetMaxBytes / NET_IF_BYTES
+    val packetQuanta = if (PauseConsts.BT_PER_QUANTA > 0) {
+      (nicConf.packetMaxBytes * 8) / PauseConsts.BT_PER_QUANTA
+    } else { 0 }
+    netio.pauser.threshold := PlusArg("pauser-threshold", 2 * packetWords + latency, width = 32)
+    netio.pauser.quanta := PlusArg("pauser-quanta", 2 * packetQuanta, width = 32)
+    netio.pauser.refresh := PlusArg("pauser-refresh", packetWords, width = 32)
+    
+    println("[SimpleDmaControllerConnector] Simple DMA Controller wrapper connected successfully.")
   }
 }
