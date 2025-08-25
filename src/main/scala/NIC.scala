@@ -947,3 +947,130 @@ object SimpleDmaControllerConnector {
     println("[SimpleDmaControllerConnector] Simple DMA Controller wrapper connected successfully.")
   }
 }
+
+// #########################################################################################
+// RecursiveDoublingWithDMA Connector Logic
+// #########################################################################################
+
+// Create a wrapper LazyModule that contains the RecursiveDoublingWithDMA implementation
+class RecursiveDoublingWithDMAWrapper(implicit p: Parameters) extends LazyModule {
+  // Elabor-time debug helper (no hardware cost when disabled)
+  private val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
+  @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+  
+  // Create a memory system for DMA operations
+  val ram = LazyModule(new TLRAM(
+    address = AddressSet(0x80000000L, 0x10000000L - 1),
+    beatBytes = 8, // Use 8 bytes to match NET_IF_BYTES
+    devName = Some("recursive-doubling-dma-ram")
+  ))
+  
+  // Create the RecursiveDoublingWithDMA module
+  val rdParams = p.lift(RecursiveDoublingWithDMAKey).flatten.getOrElse(
+    throw new Exception("RecursiveDoublingWithDMAParams not found. Did you add WithRecursiveDoublingWithDMA to your Config?")
+  )
+  val recursiveDoublingDMA = LazyModule(new RecursiveDoublingWithDMA(rdParams))
+  
+  // Connect RecursiveDoublingWithDMA to RAM
+  ram.node := recursiveDoublingDMA.node
+  
+  lazy val module = new RecursiveDoublingWithDMAWrapperModuleImp(this)
+}
+
+class RecursiveDoublingWithDMAWrapperModuleImp(outer: RecursiveDoublingWithDMAWrapper) extends LazyModuleImp(outer) {
+  val io = IO(new Bundle {
+    val net_in = Flipped(Decoupled(new StreamChannel(NET_IF_WIDTH)))
+    val net_out = Decoupled(new StreamChannel(NET_IF_WIDTH))
+  })
+  
+  val recursiveDoublingDMAModule = outer.recursiveDoublingDMA.module
+  // Instantiate the RAM module to activate TileLink connections
+  val _ = outer.ram.module
+  
+  // Connect network interface
+  io.net_in <> recursiveDoublingDMAModule.io.in
+  io.net_out <> recursiveDoublingDMAModule.io.out
+}
+
+object RecursiveDoublingWithDMAConnector {
+  def connect(netio: NICIOvonly, nicConf: NICConfig)(implicit p: Parameters): Unit = {
+    // Elabor-time debug helper (no hardware cost when disabled)
+    val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
+    @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+    
+    println("[RecursiveDoublingWithDMAConnector] Attaching RecursiveDoublingWithDMA wrapper to the NIC.")    
+
+    // Create the wrapper LazyModule that contains everything
+    val wrapper = LazyModule(new RecursiveDoublingWithDMAWrapper)
+    val wrapperModule = Module(wrapper.module)
+
+    // --- TARGETED PRINTS: Only print key events ---
+    val prev_nic_out_valid = RegNext(netio.out.valid)
+    val prev_nic_in_valid = RegNext(netio.in.valid)
+
+    // --- Step 3: Connect Data Path ---
+
+    // Connect the NIC output to the wrapper's network input.
+    // A simple Queue helps buffer the data.
+    val inQueue = Module(new Queue(chiselTypeOf(netio.out.bits), 2))
+    inQueue.io.enq.valid := netio.out.valid
+    inQueue.io.enq.bits  := netio.out.bits
+    wrapperModule.io.net_in <> inQueue.io.deq
+    println("[RecursiveDoublingWithDMAConnector] Connected netio.out -> inQueue -> wrapper.io.net_in")
+
+    // Connect the wrapper's network output to the NIC input.
+    // The wrapper's output is Decoupled, which can drive the NIC's ValidIO directly.
+    netio.in.valid := wrapperModule.io.net_out.valid
+    netio.in.bits  := wrapperModule.io.net_out.bits
+    wrapperModule.io.net_out.ready := true.B // Assume NIC input is always ready
+    println("[RecursiveDoublingWithDMAConnector] Connected wrapper.io.net_out -> netio.in")
+
+    // Force keep bits to all 1s
+    netio.in.bits.keep := NET_FULL_KEEP
+    println("[RecursiveDoublingWithDMAConnector] Forcing netio.in.bits.keep to all ones.")
+    
+    // --- TARGETED PRINTS: Only print key events ---
+    
+    // 1. NIC receives packet from C test (only when it happens)
+    when(netio.out.valid && !prev_nic_out_valid) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_RECV: data=0x${Hexadecimal(netio.out.bits.data)}, last=${netio.out.bits.last}\n")
+    }
+
+    // 2. NIC sends packet to module (only when fired)
+    when(netio.out.valid && inQueue.io.enq.ready) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_TO_MODULE: data=0x${Hexadecimal(netio.out.bits.data)}, last=${netio.out.bits.last}\n")
+    }
+    
+    // 3. NIC drops packet (only when it happens)
+    when(netio.out.valid && !inQueue.io.enq.ready && 
+         (netio.out.valid =/= prev_nic_out_valid || inQueue.io.enq.ready =/= RegNext(inQueue.io.enq.ready))) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_DROP: module not ready\n")
+    }
+
+    // 4. Module sends packet to NIC (only when fired)
+    when(wrapperModule.io.net_out.valid && wrapperModule.io.net_out.ready) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] MODULE_TO_NIC: data=0x${Hexadecimal(wrapperModule.io.net_out.bits.data)}, last=${wrapperModule.io.net_out.bits.last}\n")
+    }
+
+    // --- NEW: Debug NIC receive from module ---
+    when(netio.in.valid && !prev_nic_in_valid) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_RECV_FROM_MODULE: data=0x${Hexadecimal(netio.in.bits.data)}, last=${netio.in.bits.last}\n")
+    }
+
+    // Add standard PlusArg connections for simulation (same as other connectors)
+    netio.macAddr := PlusArg("macaddr", width = 48)
+    netio.rlimit.inc := PlusArg("rlimit-inc", 1, width = 32)
+    netio.rlimit.period := PlusArg("rlimit-period", 1, width = 32)
+    netio.rlimit.size := PlusArg("rlimit-size", 8, width = 32)
+    val latency = 10
+    val packetWords = nicConf.packetMaxBytes / NET_IF_BYTES
+    val packetQuanta = if (PauseConsts.BT_PER_QUANTA > 0) {
+      (nicConf.packetMaxBytes * 8) / PauseConsts.BT_PER_QUANTA
+    } else { 0 }
+    netio.pauser.threshold := PlusArg("pauser-threshold", 2 * packetWords + latency, width = 32)
+    netio.pauser.quanta := PlusArg("pauser-quanta", 2 * packetQuanta, width = 32)
+    netio.pauser.refresh := PlusArg("pauser-refresh", packetWords, width = 32)
+    
+    println("[RecursiveDoublingWithDMAConnector] RecursiveDoublingWithDMA wrapper connected successfully.")
+  }
+}
