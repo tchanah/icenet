@@ -26,7 +26,7 @@ case class RecursiveDoublingWithDMAParams(
     require(DataElements > 0, "DataElements must be positive.")
     // Total words = metadata word (1) + data words
     val numDataWords: Int = (DataElements*BytesPerElement) / bytesPerWord 
-    val totalWordsPerPacket: Int = 1 + numDataWords
+    val totalWordsPerPacket: Int = 2 + numDataWords
     val elementWidth: Int = 8 * BytesPerElement
     require(DataElements % bytesPerWord == 0, "For simplicity, assuming DataElements is a multiple of bytesPerWord")
     val elementsPerWord: Int = bytesPerWord / BytesPerElement
@@ -116,7 +116,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val memoryValid = RegInit(VecInit(Seq.fill(MAX_RECURSION_LEVEL)(false.B)))
 
     // --- Extended State Machine ---
-    val s_idle :: s_recv_data :: s_write_buffer :: s_wait_write_buffer :: s_process :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_send_meta :: s_send_data :: s_check_buffer :: Nil = Enum(14)
+    val s_idle :: s_recv_meta2 :: s_recv_data :: s_write_buffer :: s_wait_write_buffer :: s_process :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_send_meta :: s_send_meta2 :: s_send_data :: s_check_buffer :: Nil = Enum(16)
     val state = RegInit(s_idle)
     val prevState = RegInit(s_idle)
 
@@ -126,9 +126,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val operationReg      = Reg(UInt(8.W))
     val maxLevelReg       = Reg(UInt(8.W))
     val currentLevelReg   = Reg(UInt(8.W))
+    val chunkIndexReg     = Reg(UInt(32.W))
+    val totalChunksReg    = Reg(UInt(32.W))
 
     // --- Counters ---
-    val receivedWordCount = RegInit(0.U(outer.params.wordCountBits.W))
+    val receivedDataWordCount = RegInit(0.U(outer.params.wordCountBits.W))
     val sentWordCount = RegInit(0.U(outer.params.wordCountBits.W))
     val dmaWordCount = RegInit(0.U(outer.params.wordCountBits.W))
     val waitCounter = RegInit(0.U(8.W))
@@ -216,16 +218,29 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             operationReg      := metaWord(31, 24)
             maxLevelReg       := metaWord(55, 48)
             currentLevelReg   := metaWord(63, 56)
+            
+            // Transition to wait for the second metadata word
+            state := s_recv_meta2
+        }
+    }
 
-            // Start word count at 1 since we just received the metadata word
-            receivedWordCount := 1.U
+    .elsewhen(state === s_recv_meta2) {
+        io.out.valid := false.B
+        when(incoming_fire) {
+            val metaWord2 = incoming_bits.data
+            chunkIndexReg  := metaWord2(31, 0)
+            totalChunksReg := metaWord2(63, 32)
+
+            // Start data word count at 0 since we just finished receiving the metadata word
+            receivedDataWordCount := 0.U
             state := s_recv_data
         }
     }
+
     .elsewhen(state === s_recv_data) {
         io.out.valid := false.B
         when(incoming_fire) {
-            val baseElementIndex = (receivedWordCount - 1.U) * ELEMENTS_PER_WORD.U
+            val baseElementIndex = receivedDataWordCount * ELEMENTS_PER_WORD.U
 
             for (i <- 0 until ELEMENTS_PER_WORD) {
                 when((baseElementIndex + i.U) < NUM_DATA_ELEMENTS.U) {
@@ -234,16 +249,16 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             }
             
             // Debug: print when we're writing the last word
-            when(receivedWordCount === NUM_DATA_WORDS.U) {
+            when(receivedDataWordCount === NUM_DATA_WORDS.U - 1.U) {
                 dprintf(p"[s_recv_data] Writing last word: baseElementIndex=${baseElementIndex}, elements[${baseElementIndex}]=0x${Hexadecimal(incoming_bits.data(ELEMENT_WIDTH-1, 0))}, elements[${baseElementIndex + 1.U}]=0x${Hexadecimal(incoming_bits.data(2*ELEMENT_WIDTH-1, ELEMENT_WIDTH))}\n")
             }
             
             // Debug: print constants
-            when(receivedWordCount === 1.U) {
+            when(receivedDataWordCount === 0.U) {
                 dprintf(p"[s_recv_data] Constants: NUM_DATA_WORDS=${NUM_DATA_WORDS}, WORDS_PER_LEVEL=${WORDS_PER_LEVEL}, ELEMENTS_PER_WORD=${ELEMENTS_PER_WORD}\n")
             }
 
-            receivedWordCount := receivedWordCount + 1.U
+            receivedDataWordCount := receivedDataWordCount + 1.U
 
             when(incoming_bits.last) {
                 // Only level 0 can be processed immediately in a new test set
@@ -271,7 +286,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     state := s_write_buffer
                     dmaWordCount := 0.U
                 }
-                receivedWordCount := 0.U
+                receivedDataWordCount := 0.U
             }
         }
     }
@@ -571,12 +586,25 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     .elsewhen(state === s_send_meta) {
         io.out.valid := true.B
         outgoing_bits.data := outgoingMetadataWord
-        outgoing_bits.last := (NUM_DATA_WORDS == 0).B
+        outgoing_bits.last := false.B
         outgoing_bits.keep := (~0.U((outer.params.dataWidth / 8).W))
 
         when(io.out.fire) {
             dprintf(p"[s_send_meta] OUT META: nextLevel=${nextLevel}, maxLevel=${maxLevelReg}, op=${operationReg}, type=${collectiveTypeReg}, collId=0x${Hexadecimal(collectiveIdReg)}\n")
             sentWordCount := 1.U
+            state := s_send_meta2
+        }
+    }
+
+    .elsewhen(state === s_send_meta2) {
+        io.out.valid := true.B
+        // Assemble and send the SECOND word
+        outgoing_bits.data := Cat(totalChunksReg, chunkIndexReg)
+        outgoing_bits.last := (NUM_DATA_WORDS == 0).B
+        outgoing_bits.keep := (~0.U((outer.params.dataWidth / 8).W))
+
+        when(io.out.fire) {
+            sentWordCount := sentWordCount + 1.U // Now 2 words have been sent
             if (NUM_DATA_WORDS > 0) {
                 state := s_send_data
             } else {
@@ -584,6 +612,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             }
         }
     }
+
     .elsewhen(state === s_send_data) {
         io.out.valid := true.B
 
@@ -592,7 +621,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         val dataSource = Mux(useProcessedDataForOutput,
             Mux(storeData, processedDataBuffer, processedData),
             incomingDataBuffer)
-        val baseElementIndex = (sentWordCount - 1.U) * ELEMENTS_PER_WORD.U
+        val baseElementIndex = (sentWordCount - 2.U) * ELEMENTS_PER_WORD.U
         val dataWordVec = Wire(Vec(ELEMENTS_PER_WORD, UInt(ELEMENT_WIDTH.W)))
         
         for (i <- 0 until ELEMENTS_PER_WORD) {
@@ -657,11 +686,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
     
     // --- Input Ready Logic ---
-    io.in.ready := (state === s_idle || state === s_recv_data)
+    io.in.ready := (state === s_idle || state === s_recv_meta2 || state === s_recv_data)
 
     // --- Debug ---
     when(state =/= prevState) {
-        dprintf(p"[STATE] Transition: ${prevState} -> ${state} (level=${currentLevelReg}, recvWord=${receivedWordCount}, sentWord=${sentWordCount})\n")
+        dprintf(p"[STATE] Transition: ${prevState} -> ${state} (level=${currentLevelReg}, receivedDataWordCount=${receivedDataWordCount}, sentWordCount=${sentWordCount})\n")
         prevState := state
     }
 }
