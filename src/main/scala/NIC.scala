@@ -950,123 +950,289 @@ object SimpleDmaControllerConnector {
 
 // #########################################################################################
 // RecursiveDoublingWithDMA Connector Logic
+// 
+// This module provides a wrapper around the RecursiveDoublingWithDMA accelerator
+// that integrates it with the NIC (Network Interface Controller). It handles:
+// - DMA memory operations through a dedicated RAM subsystem
+// - Network packet routing between the NIC and the accelerator
+// - Debug output and performance monitoring
 // #########################################################################################
 
-// Create a wrapper LazyModule that contains the RecursiveDoublingWithDMA implementation
+/**
+ * Wrapper LazyModule that encapsulates the RecursiveDoublingWithDMA accelerator
+ * and provides the necessary infrastructure for DMA operations and network integration.
+ * 
+ * This wrapper is responsible for:
+ * 1. Creating and managing a dedicated RAM subsystem for DMA transfers
+ * 2. Instantiating the RecursiveDoublingWithDMA accelerator module
+ * 3. Connecting the accelerator to the RAM via TileLink protocol
+ * 4. Providing a clean interface for network packet routing
+ */
 class RecursiveDoublingWithDMAWrapper(implicit p: Parameters) extends LazyModule {
-  // Elabor-time debug helper (no hardware cost when disabled)
+  // Debug configuration: Enable/disable debug prints at elaboration time
+  // This has no hardware cost when disabled - the printf statements are optimized away
   private val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
   @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
   
-  // Create a memory system for DMA operations
+  // Dedicated RAM subsystem for DMA operations
+  // This RAM is used by the RecursiveDoublingWithDMA accelerator to store:
+  // - Input data received from the network
+  // - Intermediate computation results
+  // - Output data to be sent back to the network
   val ram = LazyModule(new TLRAM(
-    address = AddressSet(0x80000000L, 0x10000000L - 1),
-    beatBytes = 8, // Use 8 bytes to match NET_IF_BYTES
+    address = AddressSet(0x80000000L, 0x10000000L - 1), // 256MB address space starting at 2GB
+    beatBytes = 8, // 8-byte transfers to match NET_IF_BYTES for efficient network data handling
     devName = Some("recursive-doubling-dma-ram")
   ))
   
-  // Create the RecursiveDoublingWithDMA module
+  // Extract configuration parameters for the RecursiveDoublingWithDMA accelerator
+  // These parameters control the accelerator's behavior and resource allocation
   val rdParams = p.lift(RecursiveDoublingWithDMAKey).flatten.getOrElse(
     throw new Exception("RecursiveDoublingWithDMAParams not found. Did you add WithRecursiveDoublingWithDMA to your Config?")
   )
+  
+  // Instantiate the main RecursiveDoublingWithDMA accelerator module
   val recursiveDoublingDMA = LazyModule(new RecursiveDoublingWithDMA(rdParams))
   
-  // Connect RecursiveDoublingWithDMA to RAM
+  // Connect the accelerator to the RAM subsystem via TileLink protocol
+  // This enables the accelerator to perform DMA operations on the dedicated RAM
   ram.node := recursiveDoublingDMA.node
   
+  // Create the module implementation
   lazy val module = new RecursiveDoublingWithDMAWrapperModuleImp(this)
 }
 
+/**
+ * Module implementation for the RecursiveDoublingWithDMA wrapper.
+ * This class provides the actual hardware implementation that connects the
+ * accelerator to the network interface and manages the RAM subsystem.
+ */
 class RecursiveDoublingWithDMAWrapperModuleImp(outer: RecursiveDoublingWithDMAWrapper) extends LazyModuleImp(outer) {
+  // Network interface I/O bundle
+  // net_in: Receives network packets from the NIC (Flipped because it's an input to this module)
+  // net_out: Sends processed packets back to the NIC
   val io = IO(new Bundle {
     val net_in = Flipped(Decoupled(new StreamChannel(NET_IF_WIDTH)))
     val net_out = Decoupled(new StreamChannel(NET_IF_WIDTH))
   })
   
+  // Get the actual hardware module instance of the RecursiveDoublingWithDMA accelerator
   val recursiveDoublingDMAModule = outer.recursiveDoublingDMA.module
+  
   // Instantiate the RAM module to activate TileLink connections
+  // The underscore assignment ensures the module is instantiated but we don't need to reference it
   val _ = outer.ram.module
   
-  // Connect network interface
+  // Connect the network interface between the wrapper and the accelerator
+  // This creates the data path for packets flowing in and out of the accelerator
   io.net_in <> recursiveDoublingDMAModule.io.in
   io.net_out <> recursiveDoublingDMAModule.io.out
 }
 
+/**
+ * Connector object that integrates the RecursiveDoublingWithDMA accelerator with the NIC.
+ * This object provides the main connection logic that wires up the accelerator to the
+ * network interface controller, including packet routing, buffering, and debug monitoring.
+ */
 object RecursiveDoublingWithDMAConnector {
-  def connect(netio: NICIOvonly, nicConf: NICConfig)(implicit p: Parameters): Unit = {
-    // Elabor-time debug helper (no hardware cost when disabled)
+  /**
+   * Main connection function that attaches the RecursiveDoublingWithDMA accelerator to the NIC.
+   * 
+   * @param netio The NIC I/O interface that handles network packet transmission/reception
+   * @param nicConf Configuration parameters for the NIC (packet sizes, timing, etc.)
+   * @param p Implicit parameters containing system configuration
+   */
+  def connect(netio: NICIO, nicConf: NICConfig)(implicit p: Parameters): Unit = {
+    // Debug configuration: Enable/disable debug prints at elaboration time
+    // This has no hardware cost when disabled - printf statements are optimized away
     val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
     @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
     
     println("[RecursiveDoublingWithDMAConnector] Attaching RecursiveDoublingWithDMA wrapper to the NIC.")    
 
-    // Create the wrapper LazyModule that contains everything
+    // Create the wrapper LazyModule that contains the accelerator and RAM subsystem
     val wrapper = LazyModule(new RecursiveDoublingWithDMAWrapper)
     val wrapperModule = Module(wrapper.module)
 
-    // --- TARGETED PRINTS: Only print key events ---
+    // ========================================================================================
+    // Debug and Monitoring Infrastructure
+    // ========================================================================================
+    
+    // Previous state tracking for edge detection in debug prints
     val prev_nic_out_valid = RegNext(netio.out.valid)
     val prev_nic_in_valid = RegNext(netio.in.valid)
+    
+    // Packet and word counters for debug output management
+    // These counters help limit debug output to avoid overwhelming the simulation logs
+    val inPacketCount = RegInit(0.U(16.W))   // Total number of packets received from NIC
+    val outPacketCount = RegInit(0.U(16.W))  // Total number of packets sent to NIC
+    val inWordCount = RegInit(0.U(8.W))      // Word count within current input packet
+    val outWordCount = RegInit(0.U(8.W))     // Word count within current output packet
+    val MAX_DEBUG_WORDS = 3.U                // Print first 3 and last 3 words per packet to reduce log spam
 
-    // --- Step 3: Connect Data Path ---
+    // ========================================================================================
+    // Data Path Connection and Buffering
+    // ========================================================================================
 
-    // Connect the NIC output to the wrapper's network input.
-    // A simple Queue helps buffer the data.
-    val inQueue = Module(new Queue(chiselTypeOf(netio.out.bits), 2))
-    inQueue.io.enq.valid := netio.out.valid
-    inQueue.io.enq.bits  := netio.out.bits
+    // Input path: NIC -> Input Queue -> Accelerator
+    // Create a large input queue to buffer packets from the NIC before they reach the accelerator
+    // This prevents packet loss when the accelerator is busy processing previous packets
+    // Queue size of 256 entries can handle multiple large packets (130 words each)
+    val inQueue = Module(new Queue(chiselTypeOf(netio.out.bits), 256))
+    inQueue.io.enq <> netio.out
     wrapperModule.io.net_in <> inQueue.io.deq
-    println("[RecursiveDoublingWithDMAConnector] Connected netio.out -> inQueue -> wrapper.io.net_in")
+    println("[RecursiveDoublingWithDMAConnector] Connected netio.out -> inQueue (256 entries) -> wrapper.io.net_in")
 
-    // Connect the wrapper's network output to the NIC input.
-    // The wrapper's output is Decoupled, which can drive the NIC's ValidIO directly.
-    netio.in.valid := wrapperModule.io.net_out.valid
-    netio.in.bits  := wrapperModule.io.net_out.bits
-    wrapperModule.io.net_out.ready := true.B // Assume NIC input is always ready
-    println("[RecursiveDoublingWithDMAConnector] Connected wrapper.io.net_out -> netio.in")
+    // Output path: Accelerator -> Output Queue -> NIC
+    // Create a large output queue to buffer processed packets from the accelerator
+    // This allows the accelerator to continue processing while the NIC handles transmission
+    // Queue size of 256 entries can handle multiple large packets (16 packets * 130 words = 2080 words)
+    val outQueue = Module(new Queue(chiselTypeOf(wrapperModule.io.net_out.bits), 256))
+    outQueue.io.enq <> wrapperModule.io.net_out
+    println("[RecursiveDoublingWithDMAConnector] Added output queue (256 entries) after module")
 
-    // Force keep bits to all 1s
+    // Connect the output queue directly to the NIC input
+    // This creates the final link in the data path: accelerator -> queue -> NIC
+    netio.in <> outQueue.io.deq
+    println("[RecursiveDoublingWithDMAConnector] Connected wrapper.io.net_out -> outQueue -> netio.in")
+    
+    // ========================================================================================
+    // NIC Input Backpressure Monitoring
+    // ========================================================================================
+    
+    // Monitor when the NIC input buffer is full and the output queue is trying to send data
+    // This helps identify potential bottlenecks in the data path
+    val nicInputBlockCounter = RegInit(0.U(8.W))      // Counts consecutive cycles of backpressure
+    val nicInputBlockPrintCount = RegInit(0.U(4.W))   // Limits debug output to first 5 instances
+    when(outQueue.io.deq.valid && !netio.in.ready) {
+      nicInputBlockCounter := nicInputBlockCounter + 1.U
+      when(nicInputBlockCounter === 0.U && nicInputBlockPrintCount < 5.U) { // Print only first 5 instances
+        dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_INPUT_NOT_READY[${nicInputBlockPrintCount}]: NIC input buffer full\n")
+        nicInputBlockPrintCount := nicInputBlockPrintCount + 1.U
+      }
+    }.otherwise {
+      nicInputBlockCounter := 0.U
+    }
+
+    // ========================================================================================
+    // Network Interface Configuration
+    // ========================================================================================
+
+    // Force keep bits to all 1s to indicate all bytes in the packet are valid
+    // This is necessary because the accelerator processes complete packets and we want to
+    // ensure the NIC treats all data as valid
     netio.in.bits.keep := NET_FULL_KEEP
     println("[RecursiveDoublingWithDMAConnector] Forcing netio.in.bits.keep to all ones.")
     
-    // --- TARGETED PRINTS: Only print key events ---
+    // ========================================================================================
+    // Debug Output and Packet Tracking
+    // ========================================================================================
     
-    // 1. NIC receives packet from C test (only when it happens)
+    // Track incoming packet and word counts for debug output
+    // This helps monitor packet flow and identify potential issues
     when(netio.out.valid && !prev_nic_out_valid) {
-      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_RECV: data=0x${Hexadecimal(netio.out.bits.data)}, last=${netio.out.bits.last}\n")
+      when(netio.out.bits.last) {
+        inPacketCount := inPacketCount + 1.U
+        inWordCount := 0.U // Reset word count for next packet
+      }.otherwise {
+        inWordCount := inWordCount + 1.U
+      }
     }
 
-    // 2. NIC sends packet to module (only when fired)
-    when(netio.out.valid && inQueue.io.enq.ready) {
-      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_TO_MODULE: data=0x${Hexadecimal(netio.out.bits.data)}, last=${netio.out.bits.last}\n")
+    // Debug print: NIC receives data from external source (C test)
+    // Only print first few and last few words per packet to avoid log spam
+    when(netio.out.valid && !prev_nic_out_valid && 
+         (inWordCount < MAX_DEBUG_WORDS || inWordCount >= 127.U || netio.out.bits.last)) { // 130 total words
+      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_RECV[P${inPacketCount}W${inWordCount}]: data=0x${Hexadecimal(netio.out.bits.data)}, last=${netio.out.bits.last}\n")
+    }
+
+    // Debug print: NIC sends data to accelerator module
+    // Only print first few and last few words per packet to avoid log spam
+    when(netio.out.valid && inQueue.io.enq.ready && 
+         (inWordCount < MAX_DEBUG_WORDS || inWordCount >= 127.U || netio.out.bits.last)) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_TO_MODULE[P${inPacketCount}W${inWordCount}]: data=0x${Hexadecimal(netio.out.bits.data)}, last=${netio.out.bits.last}\n")
     }
     
-    // 3. NIC drops packet (only when it happens)
+    // Debug print: Packet dropped due to input queue being full
+    // This indicates the accelerator is not keeping up with incoming data
     when(netio.out.valid && !inQueue.io.enq.ready && 
          (netio.out.valid =/= prev_nic_out_valid || inQueue.io.enq.ready =/= RegNext(inQueue.io.enq.ready))) {
       dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_DROP: module not ready\n")
     }
 
-    // 4. Module sends packet to NIC (only when fired)
-    when(wrapperModule.io.net_out.valid && wrapperModule.io.net_out.ready) {
-      dprintf(p"[RecursiveDoublingWithDMAConnector] MODULE_TO_NIC: data=0x${Hexadecimal(wrapperModule.io.net_out.bits.data)}, last=${wrapperModule.io.net_out.bits.last}\n")
+    // Track outgoing packet and word counts for debug output
+    when(wrapperModule.io.net_out.valid && outQueue.io.enq.ready) {
+      when(wrapperModule.io.net_out.bits.last) {
+        outPacketCount := outPacketCount + 1.U
+        outWordCount := 0.U // Reset word count for next packet
+      }.otherwise {
+        outWordCount := outWordCount + 1.U
+      }
     }
 
-    // --- NEW: Debug NIC receive from module ---
-    when(netio.in.valid && !prev_nic_in_valid) {
-      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_RECV_FROM_MODULE: data=0x${Hexadecimal(netio.in.bits.data)}, last=${netio.in.bits.last}\n")
+    // Debug print: Accelerator sends data to output queue
+    // Only print first few and last few words per packet to avoid log spam
+    when(wrapperModule.io.net_out.valid && outQueue.io.enq.ready && 
+         (outWordCount < MAX_DEBUG_WORDS || outWordCount >= 127.U || wrapperModule.io.net_out.bits.last)) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] MODULE_TO_QUEUE[P${outPacketCount}W${outWordCount}]: data=0x${Hexadecimal(wrapperModule.io.net_out.bits.data)}, last=${wrapperModule.io.net_out.bits.last}\n")
     }
 
-    // Add standard PlusArg connections for simulation (same as other connectors)
+    // Debug print: Output queue sends complete packet to NIC
+    // This provides a summary when each packet is fully transmitted
+    when(outQueue.io.deq.valid && netio.in.ready && outQueue.io.deq.bits.last) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] QUEUE_TO_NIC[P${outPacketCount}]: packet complete (130 words)\n")
+    }
+
+    // ========================================================================================
+    // Queue Status Monitoring and Backpressure Detection
+    // ========================================================================================
+    
+    // Monitor output queue fullness to detect potential bottlenecks
+    // Only print when queue is nearly full (>240/256) or completely empty to avoid spam
+    val queueFullness = outQueue.io.count
+    val prevQueueFullness = RegNext(queueFullness)
+    when(queueFullness =/= prevQueueFullness && (queueFullness > 240.U || queueFullness === 0.U)) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] OUTPUT_QUEUE_STATUS: count=${queueFullness}/256\n")
+    }
+
+    // Monitor when the accelerator is blocked by a full output queue
+    // This indicates the NIC is not keeping up with the accelerator's output rate
+    val blockCounter = RegInit(0.U(8.W))
+    when(wrapperModule.io.net_out.valid && !outQueue.io.enq.ready) {
+      blockCounter := blockCounter + 1.U
+      when(blockCounter === 0.U) { // Print only once every 256 cycles to avoid spam
+        dprintf(p"[RecursiveDoublingWithDMAConnector] MODULE_BLOCKED: output queue full, count=${queueFullness}/256\n")
+      }
+    }.otherwise {
+      blockCounter := 0.U
+    }
+
+    // Debug print: NIC receives complete packet from accelerator
+    // This confirms successful end-to-end packet transmission
+    when(netio.in.valid && !prev_nic_in_valid && netio.in.bits.last) {
+      dprintf(p"[RecursiveDoublingWithDMAConnector] NIC_RECV_FROM_MODULE[P${outPacketCount}]: packet complete (130 words)\n")
+    }
+
+    // ========================================================================================
+    // NIC Configuration and Simulation Parameters
+    // ========================================================================================
+    
+    // Configure NIC with standard PlusArg connections for simulation
+    // These parameters can be overridden at runtime via command-line arguments
     netio.macAddr := PlusArg("macaddr", width = 48)
     netio.rlimit.inc := PlusArg("rlimit-inc", 1, width = 32)
     netio.rlimit.period := PlusArg("rlimit-period", 1, width = 32)
     netio.rlimit.size := PlusArg("rlimit-size", 8, width = 32)
-    val latency = 10
-    val packetWords = nicConf.packetMaxBytes / NET_IF_BYTES
+    
+    // Calculate packet flow control parameters based on NIC configuration
+    val latency = 10  // Base latency in cycles
+    val packetWords = nicConf.packetMaxBytes / NET_IF_BYTES  // Number of words per packet
     val packetQuanta = if (PauseConsts.BT_PER_QUANTA > 0) {
-      (nicConf.packetMaxBytes * 8) / PauseConsts.BT_PER_QUANTA
+      (nicConf.packetMaxBytes * 8) / PauseConsts.BT_PER_QUANTA  // Bits per quanta for flow control
     } else { 0 }
+    
+    // Configure pause mechanism for flow control
+    // This prevents buffer overflow by pausing transmission when buffers are nearly full
     netio.pauser.threshold := PlusArg("pauser-threshold", 2 * packetWords + latency, width = 32)
     netio.pauser.quanta := PlusArg("pauser-quanta", 2 * packetQuanta, width = 32)
     netio.pauser.refresh := PlusArg("pauser-refresh", packetWords, width = 32)
