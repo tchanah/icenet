@@ -18,14 +18,15 @@ case class RecursiveDoublingWithDMAParams(
     dataWidth: Int          = 64,           // Width of the streaming interface in bits
     baseMemoryAddr: BigInt  = 0x80000000L,  // Base address for DMA operations
     sourceIds: Int          = 256,          // Number of TileLink source IDs for concurrent transactions
-    MaxChunks: Int          = 1024,         // Maximum number of chunks (1MB / 1KB = 1024)
+    MaxChunks: Int          = 1024,         // Maximum number of logical chunks
+    numMemoryBlocks: Int    = 1024,         // For 1MB RAM with 1KB chunks
     EnableDebug: Boolean    = true          // Elabor-time debug printing (no hardware cost when false)
 ) {
     // Derived parameters
     val bytesPerWord: Int           = dataWidth / 8
     require(dataWidth % 8 == 0, "dataWidth must be a multiple of 8.")
     require(DataElements > 0, "DataElements must be positive.")
-    require(MaxChunks > 0 && MaxChunks <= 1024, "MaxChunks must be between 1 and 1024")
+    require(MaxChunks > 0, "MaxChunks must be positive.")
     
     // Total words = metadata word (2) + data words
     val numDataWords: Int           = (DataElements*BytesPerElement) / bytesPerWord 
@@ -122,6 +123,16 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // Chunk processing tracking per level (bit vector indicating which chunks have been processed)
     val chunkProcessedBits      = RegInit(VecInit(Seq.fill(MAX_RECURSION_LEVEL)(VecInit(Seq.fill(MAX_CHUNKS)(false.B)))))
 
+    // --- Dynamic Memory Management ---
+    val NUM_MEM_BLOCKS = outer.params.numMemoryBlocks
+    // A bitmap to track free 1KB blocks in the RAM. true = free.
+    val memBlockFree = RegInit(VecInit(Seq.fill(NUM_MEM_BLOCKS)(true.B)))
+    val BLOCK_INDEX_BITS = log2Ceil(NUM_MEM_BLOCKS)
+
+    // Tables to store the block index for each chunk's data
+    val incomingChunkBlockIndex = Reg(Vec(MAX_RECURSION_LEVEL, Vec(MAX_CHUNKS, UInt(BLOCK_INDEX_BITS.W))))
+    val processedChunkBlockIndex = Reg(Vec(MAX_RECURSION_LEVEL, Vec(MAX_CHUNKS, UInt(BLOCK_INDEX_BITS.W))))
+
     // --- Extended State Machine ---
     val s_idle :: s_recv_meta2 :: s_recv_data :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_send_meta :: s_send_meta2 :: s_send_data :: s_check_chunks :: Nil = Enum(13)
     val state                   = RegInit(s_idle)
@@ -140,9 +151,14 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val processingChunkIndex    = RegInit(0.U(CHUNK_INDEX_BITS.W))
     val processingLevel         = RegInit(0.U(outer.params.levelCountBits.W))
 
+    // Register to hold the physical block index of the chunk currently being read
+    val blockIndexInFlightReg   = Reg(UInt(BLOCK_INDEX_BITS.W))
+    // Register to hold the physical block index for the chunk currently being written
+    val blockIndexToWriteReg    = Reg(UInt(BLOCK_INDEX_BITS.W))
+
     // --- Counters ---
     val receivedDataWordCount   = RegInit(0.U(outer.params.wordCountBits.W))
-    val sentDataWordCount           = RegInit(0.U(outer.params.wordCountBits.W))
+    val sentDataWordCount       = RegInit(0.U(outer.params.wordCountBits.W))
     val dmaWordCount            = RegInit(0.U(outer.params.wordCountBits.W))
     
     // Add counter for tracking output backpressure
@@ -181,14 +197,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     tl.a.bits                   := DontCare
     tl.d.ready                  := false.B
     
-    // Separate address spaces for incoming vs processed data
-    def getIncomingChunkAddress(level: UInt, chunkIndex: UInt): UInt = {
-        outer.params.baseMemoryAddr.U(48.W) + (level * MAX_BYTES_PER_LEVEL.U) + (chunkIndex * BYTES_PER_CHUNK.U)
-    }
-    
-    def getProcessedChunkAddress(level: UInt, chunkIndex: UInt): UInt = { // Processed data storage: after all incoming data storage
-        outer.params.baseMemoryAddr.U(48.W) + ((MAX_RECURSION_LEVEL.U + level) * MAX_BYTES_PER_LEVEL.U) + (chunkIndex * BYTES_PER_CHUNK.U)
-    }
+    // Dynamic addressing replaces static helper functions for address calculation
     
     // Helper function to check if all required chunks are available for processing
     // Note: Level 0 chunks are processed immediately during receive, so this only handles Level 1+
@@ -244,6 +253,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                         chunkProcessedBits(level)(chunk)    := false.B
                     }
                 }
+                // Mark all memory blocks as free for the new collective
+                for (i <- 0 until NUM_MEM_BLOCKS) { memBlockFree(i) := true.B }
+                dprintf(p"[s_idle] Resetting memory manager: all ${NUM_MEM_BLOCKS} blocks are now free.\n")
             }
             
             collectiveIdReg     := newCollectiveId
@@ -305,76 +317,84 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             receivedDataWordCount := receivedDataWordCount + 1.U
 
             when(incoming_bits.last) {
+                blockIndexToWriteReg := PriorityEncoder(memBlockFree.asUInt) // LATCH the destination block index
+                state                   := s_dma_write
+                dmaWordCount            := 0.U
+                receivedDataWordCount   := 0.U
+                isStoringIncomingData   := Mux(currentLevelReg === 0.U, false.B, true.B)
+
+                // Conditional debug print
                 when(currentLevelReg === 0.U) {
-                    // Level 0 Optimization: Data already written to processedDataBuffer, ready to send
                     dprintf(p"[s_recv_data] Level 0 optimization: data already in processedDataBuffer, ready to send\n")
-                    isStoringIncomingData   := false.B  // Store as processed data
-                    state                   := s_dma_write
-                    dmaWordCount            := 0.U
-                    receivedDataWordCount   := 0.U
                 }.otherwise {
-                    // Higher levels: Store as incoming data first (will be processed later)
                     dprintf(p"[s_recv_data] Store first: storing chunk ${chunkIndexReg} for level ${currentLevelReg} to memory\n")
-                    isStoringIncomingData   := true.B
-                    state                   := s_dma_write
-                    dmaWordCount            := 0.U
-                    receivedDataWordCount   := 0.U
                 }
             }
         }
     }
     
     .elsewhen(state === s_dma_write) {
-        // Write data to memory for current level (one outstanding Put at a time)
-        when(dmaWordCount < WORDS_PER_LEVEL.U) {
+        // A block is available if the one we pre-selected is still free (for word 0)
+        // or if we are continuing a write to a block we've already claimed.
+        val blockAvailable = memBlockFree(blockIndexToWriteReg) || (dmaWordCount > 0.U)
+
+        when(dmaWordCount < WORDS_PER_CHUNK.U && !blockAvailable) {
+            dprintf(p"[s_dma_write] STALL: Memory is full. Waiting for a block to be freed.\n")
+        }
+
+        // Write data to memory, but only if a free block is available
+        when(dmaWordCount < WORDS_PER_CHUNK.U && blockAvailable) {
             tl.a.valid          := true.B
             tl.a.bits.opcode    := TLMessages.PutFullData
             tl.a.bits.param     := 0.U
             tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
-            // Use a fixed safe source ID since we serialize writes
-            tl.a.bits.source    := 0.U
-            // Use different address spaces for incoming vs processed data
-            val baseAddr        = Mux(isStoringIncomingData, 
-                                        getIncomingChunkAddress(currentLevelReg, chunkIndexReg),
-                                        getProcessedChunkAddress(currentLevelReg, chunkIndexReg))
+            tl.a.bits.source    := 0.U // Serialize writes
+
+            // Calculate address dynamically based on the first available free block
+            val baseAddr = outer.params.baseMemoryAddr.U + (blockIndexToWriteReg << log2Ceil(BYTES_PER_CHUNK).U)
             tl.a.bits.address   := baseAddr + (dmaWordCount << log2Ceil(BYTES_PER_WORD).U)
             tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
 
-            // Pack data elements into word
             val baseElementIndex = dmaWordCount * ELEMENTS_PER_WORD.U
             val dataWord        = Wire(UInt(outer.params.dataWidth.W))
-            val dataVec         = Wire(Vec(ELEMENTS_PER_WORD, UInt(ELEMENT_WIDTH.W)))
-
-            // Select correct data source based on what we're storing
             val dataSource      = Mux(isStoringIncomingData, incomingDataBuffer, processedDataBuffer)
-
-            // Default initialize to zero to avoid uninitialized sinks
-            for (i <- 0 until ELEMENTS_PER_WORD) { dataVec(i) := 0.U }
+            val dataVec         = Wire(Vec(ELEMENTS_PER_WORD, UInt(ELEMENT_WIDTH.W)))
             for (i <- 0 until ELEMENTS_PER_WORD) {
-                when((baseElementIndex + i.U) < NUM_DATA_ELEMENTS.U) {
-                    dataVec(i) := dataSource(baseElementIndex + i.U)
-                }
+                dataVec(i) := Mux((baseElementIndex + i.U) < NUM_DATA_ELEMENTS.U, dataSource(baseElementIndex + i.U), 0.U)
             }
             dataWord            := Cat(dataVec.reverse)
             tl.a.bits.data      := dataWord
 
             when(tl.a.fire) {
-                // Only print for the first and last word of the DMA transfer.
-                when(dmaWordCount === 0.U || dmaWordCount === (WORDS_PER_LEVEL.U - 1.U)) {
+                // On the first word, update the memory management tables
+                when(dmaWordCount === 0.U) {
+                    memBlockFree(blockIndexToWriteReg) := false.B
+                    when(isStoringIncomingData) {
+                        incomingChunkBlockIndex(currentLevelReg)(chunkIndexReg) := blockIndexToWriteReg
+                        dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for INCOMING L${currentLevelReg}C${chunkIndexReg}\n")
+                    }.otherwise {
+                        processedChunkBlockIndex(currentLevelReg)(chunkIndexReg) := blockIndexToWriteReg
+                        dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for PROCESSED L${currentLevelReg}C${chunkIndexReg}\n")
+                    }
+                }
+
+                // Debug prints for first and last word, including elements
+                when(dmaWordCount === 0.U || dmaWordCount === (WORDS_PER_CHUNK.U - 1.U)) {
                     when(isStoringIncomingData) {
                         dprintf(p"[s_dma_write] Write request: incoming data, level=${currentLevelReg}, chunk=${chunkIndexReg}, word=${dmaWordCount}, addr=0x${Hexadecimal(tl.a.bits.address)}\n")
                     }.otherwise {
                         dprintf(p"[s_dma_write] Write request: processed data, level=${currentLevelReg}, chunk=${chunkIndexReg}, word=${dmaWordCount}, addr=0x${Hexadecimal(tl.a.bits.address)}\n")
                     }
-                    val eIdx0   = baseElementIndex
-                    val eIdx1   = baseElementIndex + 1.U
-                    val e0      = Mux(eIdx0 < NUM_DATA_ELEMENTS.U, dataSource(eIdx0), 0.U)
-                    val e1      = Mux(eIdx1 < NUM_DATA_ELEMENTS.U, dataSource(eIdx1), 0.U)
+                    val eIdx0 = baseElementIndex
+                    val eIdx1 = baseElementIndex + 1.U
+                    val e0    = Mux(eIdx0 < NUM_DATA_ELEMENTS.U, dataSource(eIdx0), 0.U)
+                    val e1    = Mux(eIdx1 < NUM_DATA_ELEMENTS.U, dataSource(eIdx1), 0.U)
                     dprintf(p"[s_dma_write]   Elements: [${eIdx0}]=0x${Hexadecimal(e0)}, [${eIdx1}]=0x${Hexadecimal(e1)}\n")
                 }
-
                 state           := s_wait_write
             }
+        }.elsewhen(dmaWordCount < WORDS_PER_CHUNK.U && !blockAvailable) {
+            dprintf(p"[s_dma_write] STALL: Memory is full. Waiting for a block to be freed.\n")
         }
     }
 
@@ -414,13 +434,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             tl.a.bits.param     := 0.U
             tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
             tl.a.bits.source    := 0.U
-            
-            // Choose address based on what we're reading
-            val readAddr = Mux(isReadingInputData,
-                              // Phase 1: Reading input data for current level
-                              getIncomingChunkAddress(processingLevel, processingChunkIndex) + (readReqCount << log2Ceil(BYTES_PER_WORD).U),
-                              // Phase 2: Reading processed data from previous level
-                              getProcessedChunkAddress(processingLevel - 1.U, processingChunkIndex) + (readReqCount << log2Ceil(BYTES_PER_WORD).U))
+            // Calculate the address from the base and block index
+            val baseReadAddr = outer.params.baseMemoryAddr.U + (blockIndexInFlightReg << log2Ceil(BYTES_PER_CHUNK).U)
+            val readAddr = baseReadAddr + (readReqCount << log2Ceil(BYTES_PER_WORD).U)
             
             tl.a.bits.address   := readAddr
             tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
@@ -433,8 +449,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                         dprintf(p"[s_dma_read] Reading previous level data: level=${processingLevel - 1.U}, chunk=${processingChunkIndex}, word=${readReqCount}, addr=0x${Hexadecimal(readAddr)}\n")
                     }
                 }
-
-                state       := s_wait_read
+                
+                state                   := s_wait_read
             }
         }
     }
@@ -475,11 +491,20 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             when(readWordCount + 1.U < WORDS_PER_CHUNK.U) {
                 state       := s_dma_read
             }.otherwise {
-                // Read phase complete - determine next action
+                // Read phase complete. The data is now in internal buffers, so we can free the memory block.
+                // The block index was latched during the read request. Use the registered value.
+                memBlockFree(blockIndexInFlightReg) := true.B
+                dprintf(p"[s_wait_read] Read complete. Freed memory block ${blockIndexInFlightReg}.\n")
+
+                // Now, determine next action
                 when(isReadingInputData) {
                     // Phase 1 complete, start Phase 2: read previous level data
                     // Note: Level 0 never reaches read states with our optimization
                     dprintf(p"[s_wait_read] Input data read complete, starting previous level read\n")
+
+                    // Calculate and store the NEXT block index for the second read phase
+                    blockIndexInFlightReg   := processedChunkBlockIndex(processingLevel - 1.U)(processingChunkIndex)
+
                     isReadingInputData  := false.B
                     readWordCount       := 0.U
                     readReqCount        := 0.U
@@ -498,6 +523,15 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         // Note: Level 0 never reaches this state with our optimization
         dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition pipeline for level ${processingLevel}, chunk ${processingChunkIndex}\n")
         dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, memoryReadBuffer[0]=0x${Hexadecimal(memoryReadBuffer(0))}\n")
+
+            // Both input data and previous level data are now in buffers, ready for FPU
+        dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition for L${processingLevel}C${processingChunkIndex}\n")
+
+        // DEBUG: Print the first few elements of the input buffers to verify correctness
+        dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, [1]=0x${Hexadecimal(incomingDataBuffer(1))}\n")
+        dprintf(p"[s_wait_read_done] memoryReadBuffer[0]  =0x${Hexadecimal(memoryReadBuffer(0))}, [1]=0x${Hexadecimal(memoryReadBuffer(1))}\n")
+
+
         state           := s_fp_add_pipe
         elementIdx      := 0.U
     }
@@ -520,12 +554,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         // TRANSITION: When the last element is processed, move to the next state.
         when(elementIdx === (NUM_DATA_ELEMENTS - 1).U) {
             dprintf(p"[s_fp_add_pipe] All FP results collected.\n")
-            if (dbgEnabled) {
-                dprintf(p"[s_fp_add_pipe] Last FP sum: 0x${Hexadecimal(sum)}\n")
-            }
+            dprintf(p"[s_fp_add_pipe] processedDataBuffer[0]=0x${Hexadecimal(processedDataBuffer(0))}, [1]=0x${Hexadecimal(processedDataBuffer(1))}\n")
+            dprintf(p"[s_fp_add_pipe] Last FP sum: 0x${Hexadecimal(sum)}\n")
+            
             when(processingLevel < maxLevelReg) {
                 // Store processed data back to memory
                 dprintf(p"[s_fp_add_pipe] Chunk ${processingChunkIndex} FPU processing complete for level ${processingLevel}, storing to memory\n")
+                blockIndexToWriteReg    := PriorityEncoder(memBlockFree.asUInt) // LATCH the destination block index
                 isStoringIncomingData   := false.B  // This is processed data, not incoming data
                 currentLevelReg         := processingLevel
                 chunkIndexReg           := processingChunkIndex
@@ -682,6 +717,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         
         when(foundChunk) {
             dprintf(p"[s_check_chunks] Found processable chunk ${foundChunkIndex} at level ${foundLevel}\n")
+
+            // === OPTIMIZATION: Calculate and store the block index ONCE here ===
+            // Note: For any level > 0, the first read is always the "incoming" data.
+            blockIndexInFlightReg   := incomingChunkBlockIndex(foundLevel)(foundChunkIndex)
+
             processingChunkIndex    := foundChunkIndex
             processingLevel         := foundLevel
             isReadingInputData      := true.B
@@ -696,7 +736,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
     
     // --- Input Ready Logic ---
-    io.in.ready     := (state === s_idle || state === s_recv_meta2 || state === s_recv_data)
+    val memoryHasSpace = memBlockFree.asUInt.orR
+    io.in.ready     := (state === s_idle || state === s_recv_meta2 || state === s_recv_data) && memoryHasSpace
 
     // --- Debug ---
     when(state =/= prevState) {
@@ -714,6 +755,7 @@ class WithRecursiveDoublingWithDMA(
     baseAddr: BigInt        = 0x80000000L,
     sourceIds: Int          = 8,
     maxChunks: Int          = 1024,
+    numMemoryBlocks: Int    = 1024,
     EnableDebug: Boolean    = true
 ) extends Config((site, here, up) => {
     case RecursiveDoublingWithDMAKey => Some(RecursiveDoublingWithDMAParams(
@@ -724,6 +766,7 @@ class WithRecursiveDoublingWithDMA(
         baseMemoryAddr      = baseAddr,
         sourceIds           = sourceIds,
         MaxChunks           = maxChunks,
+        numMemoryBlocks     = numMemoryBlocks,
         EnableDebug         = EnableDebug
     ))
 }) 

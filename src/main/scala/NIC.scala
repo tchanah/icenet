@@ -980,7 +980,7 @@ class RecursiveDoublingWithDMAWrapper(implicit p: Parameters) extends LazyModule
   // - Intermediate computation results
   // - Output data to be sent back to the network
   val ram = LazyModule(new TLRAM(
-    address = AddressSet(0x80000000L, 0x10000000L - 1), // 256MB address space starting at 2GB
+    address = AddressSet(0x80000000L, 0x100000L - 1), // 1MB address space starting at 2GB
     beatBytes = 8, // 8-byte transfers to match NET_IF_BYTES for efficient network data handling
     devName = Some("recursive-doubling-dma-ram")
   ))
