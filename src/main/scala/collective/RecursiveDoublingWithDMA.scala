@@ -124,17 +124,34 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val chunkProcessedBits      = RegInit(VecInit(Seq.fill(MAX_RECURSION_LEVEL)(VecInit(Seq.fill(MAX_CHUNKS)(false.B)))))
 
     // --- Dynamic Memory Management ---
-    val NUM_MEM_BLOCKS = outer.params.numMemoryBlocks
+    val NUM_MEM_BLOCKS          = outer.params.numMemoryBlocks
     // A bitmap to track free 1KB blocks in the RAM. true = free.
-    val memBlockFree = RegInit(VecInit(Seq.fill(NUM_MEM_BLOCKS)(true.B)))
-    val BLOCK_INDEX_BITS = log2Ceil(NUM_MEM_BLOCKS)
+    val memBlockFree            = RegInit(VecInit(Seq.fill(NUM_MEM_BLOCKS)(true.B)))
+    val BLOCK_INDEX_BITS        = log2Ceil(NUM_MEM_BLOCKS)
+    val numFreeBlocks           = RegInit(NUM_MEM_BLOCKS.U((BLOCK_INDEX_BITS + 1).W))
+    val allocSearchPtr          = RegInit(0.U(BLOCK_INDEX_BITS.W))
+    val foundBlockValid         = RegInit(false.B)
+    val foundBlockIndex         = Reg(UInt(BLOCK_INDEX_BITS.W))
+
+    // --- Background Chunk Searcher ---
+    val chunkSearchLevel        = RegInit(1.U(outer.params.levelCountBits.W))
+    val chunkSearchChunk        = RegInit(0.U(CHUNK_INDEX_BITS.W))
+    val foundChunkValid         = RegInit(false.B)
+    val foundChunkLevel         = Reg(UInt(outer.params.levelCountBits.W))
+    val foundChunkIndex         = Reg(UInt(CHUNK_INDEX_BITS.W))
+    val isProcessing            = RegInit(false.B)
+    
+    // Fast-track processing state
+    val fastTrackValid          = RegInit(false.B)
+    val fastTrackLevel          = Reg(UInt(outer.params.levelCountBits.W))
+    val fastTrackChunk          = Reg(UInt(CHUNK_INDEX_BITS.W))
 
     // Tables to store the block index for each chunk's data
     val incomingChunkBlockIndex = Reg(Vec(MAX_RECURSION_LEVEL, Vec(MAX_CHUNKS, UInt(BLOCK_INDEX_BITS.W))))
     val processedChunkBlockIndex = Reg(Vec(MAX_RECURSION_LEVEL, Vec(MAX_CHUNKS, UInt(BLOCK_INDEX_BITS.W))))
 
     // --- Extended State Machine ---
-    val s_idle :: s_recv_meta2 :: s_recv_data :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_send_meta :: s_send_meta2 :: s_send_data :: s_check_chunks :: Nil = Enum(13)
+    val s_idle :: s_recv_meta2 :: s_recv_data :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_wait_alloc :: s_send_meta :: s_send_meta2 :: s_send_data :: s_check_chunks :: Nil = Enum(14)
     val state                   = RegInit(s_idle)
     val prevState               = RegInit(s_idle)
 
@@ -256,6 +273,17 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 // Mark all memory blocks as free for the new collective
                 for (i <- 0 until NUM_MEM_BLOCKS) { memBlockFree(i) := true.B }
                 dprintf(p"[s_idle] Resetting memory manager: all ${NUM_MEM_BLOCKS} blocks are now free.\n")
+
+                numFreeBlocks           := NUM_MEM_BLOCKS.U
+                allocSearchPtr          := 0.U
+                foundBlockValid         := false.B
+                
+                // Reset background chunk searcher
+                chunkSearchLevel        := 1.U
+                chunkSearchChunk        := 0.U
+                foundChunkValid         := false.B
+                isProcessing            := false.B
+                fastTrackValid          := false.B
             }
             
             collectiveIdReg     := newCollectiveId
@@ -266,6 +294,25 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             
             // Transition to wait for the second metadata word
             state               := s_recv_meta2
+            
+        // PRIORITY 2: No incoming packet, but the background search found a chunk.
+        } .elsewhen(foundChunkValid) {
+            dprintf(p"[s_idle] Consuming chunk C${foundChunkIndex} at L${foundChunkLevel} found by background search.\n")
+
+            // Consume the found chunk
+            processingLevel         := foundChunkLevel
+            processingChunkIndex    := foundChunkIndex
+            blockIndexInFlightReg   := incomingChunkBlockIndex(foundChunkLevel)(foundChunkIndex)
+            
+            // Invalidate the found chunk to re-enable the background search.
+            foundChunkValid         := false.B
+            isProcessing            := true.B
+
+            // Jump directly to processing
+            isReadingInputData      := true.B
+            state                   := s_dma_read
+            readWordCount           := 0.U
+            readReqCount            := 0.U
         }
     }
 
@@ -317,11 +364,23 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             receivedDataWordCount := receivedDataWordCount + 1.U
 
             when(incoming_bits.last) {
-                blockIndexToWriteReg := PriorityEncoder(memBlockFree.asUInt) // LATCH the destination block index
-                state                   := s_dma_write
+                // Determine if storing incoming or processed (always incoming here, except L0)
+                isStoringIncomingData   := Mux(currentLevelReg === 0.U, false.B, true.B)
+
+                // Check if allocator is ready
+                when(foundBlockValid) { // Allocator has a block ready NOW
+                    dprintf(p"[s_recv_data] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
+                    blockIndexToWriteReg    := foundBlockIndex
+                    foundBlockValid         := false.B
+                    allocSearchPtr          := foundBlockIndex + 1.U
+                    state                   := s_dma_write // Go directly to write
+                } .otherwise { // Allocator not ready, need to wait
+                    dprintf(p"[s_recv_data] Allocator not ready. Transitioning to s_wait_alloc.\n")
+                    state                   := s_wait_alloc // Go to waiting state
+                }
+                // Reset counters regardless of next state
                 dmaWordCount            := 0.U
                 receivedDataWordCount   := 0.U
-                isStoringIncomingData   := Mux(currentLevelReg === 0.U, false.B, true.B)
 
                 // Conditional debug print
                 when(currentLevelReg === 0.U) {
@@ -334,16 +393,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
     
     .elsewhen(state === s_dma_write) {
-        // A block is available if the one we pre-selected is still free (for word 0)
-        // or if we are continuing a write to a block we've already claimed.
-        val blockAvailable = memBlockFree(blockIndexToWriteReg) || (dmaWordCount > 0.U)
-
-        when(dmaWordCount < WORDS_PER_CHUNK.U && !blockAvailable) {
-            dprintf(p"[s_dma_write] STALL: Memory is full. Waiting for a block to be freed.\n")
-        }
-
-        // Write data to memory, but only if a free block is available
-        when(dmaWordCount < WORDS_PER_CHUNK.U && blockAvailable) {
+        // Write data to memory
+        when(dmaWordCount < WORDS_PER_CHUNK.U) {
             tl.a.valid          := true.B
             tl.a.bits.opcode    := TLMessages.PutFullData
             tl.a.bits.param     := 0.U
@@ -368,7 +419,10 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             when(tl.a.fire) {
                 // On the first word, update the memory management tables
                 when(dmaWordCount === 0.U) {
-                    memBlockFree(blockIndexToWriteReg) := false.B
+                    memBlockFree(blockIndexToWriteReg)  := false.B
+                    numFreeBlocks                       := numFreeBlocks - 1.U
+                    dprintf(p"[s_dma_write] Decremented free blocks to ${numFreeBlocks - 1.U}\n")
+
                     when(isStoringIncomingData) {
                         incomingChunkBlockIndex(currentLevelReg)(chunkIndexReg) := blockIndexToWriteReg
                         dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for INCOMING L${currentLevelReg}C${chunkIndexReg}\n")
@@ -393,8 +447,6 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 }
                 state           := s_wait_write
             }
-        }.elsewhen(dmaWordCount < WORDS_PER_CHUNK.U && !blockAvailable) {
-            dprintf(p"[s_dma_write] STALL: Memory is full. Waiting for a block to be freed.\n")
         }
     }
 
@@ -414,6 +466,15 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
                     // Just stored incoming data - now check if processing is possible
                     isStoringIncomingData   := false.B
+                    
+                    // Fast-track check: Is this incoming chunk now processable?
+                    val incomingChunkProcessable = canProcessChunk(currentLevelReg, chunkIndexReg)
+                    when(incomingChunkProcessable) {
+                        dprintf(p"[s_wait_write] FAST-TRACK: Incoming chunk L${currentLevelReg}C${chunkIndexReg} is immediately processable\n")
+                        fastTrackValid          := true.B
+                        fastTrackLevel          := currentLevelReg
+                        fastTrackChunk          := chunkIndexReg
+                    }
                     state                   := s_check_chunks
                 }.otherwise {
                     dprintf(p"[s_wait_write] Processed Level ${currentLevelReg} Chunk ${chunkIndexReg} stored\n")
@@ -494,7 +555,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 // Read phase complete. The data is now in internal buffers, so we can free the memory block.
                 // The block index was latched during the read request. Use the registered value.
                 memBlockFree(blockIndexInFlightReg) := true.B
-                dprintf(p"[s_wait_read] Read complete. Freed memory block ${blockIndexInFlightReg}.\n")
+                numFreeBlocks                       := numFreeBlocks + 1.U
+                dprintf(p"[s_wait_read] Read complete. Freed block ${blockIndexInFlightReg}. Free blocks: ${numFreeBlocks + 1.U}\n")
 
                 // Now, determine next action
                 when(isReadingInputData) {
@@ -559,12 +621,25 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             
             when(processingLevel < maxLevelReg) {
                 // Store processed data back to memory
-                dprintf(p"[s_fp_add_pipe] Chunk ${processingChunkIndex} FPU processing complete for level ${processingLevel}, storing to memory\n")
-                blockIndexToWriteReg    := PriorityEncoder(memBlockFree.asUInt) // LATCH the destination block index
-                isStoringIncomingData   := false.B  // This is processed data, not incoming data
+                dprintf(p"[s_fp_add_pipe] Chunk ${processingChunkIndex} FPU complete for L${processingLevel}. Checking allocator...\n")
+                
+                // Set up info needed for DMA write *before* checking allocator
+                isStoringIncomingData   := false.B // This is always processed data
                 currentLevelReg         := processingLevel
                 chunkIndexReg           := processingChunkIndex
-                state                   := s_dma_write
+
+                // Check if allocator is ready
+                when(foundBlockValid) { // Allocator ready NOW
+                    dprintf(p"[s_fp_add_pipe] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
+                    blockIndexToWriteReg    := foundBlockIndex
+                    foundBlockValid         := false.B
+                    allocSearchPtr          := foundBlockIndex + 1.U
+                    state                   := s_dma_write // Go directly to write
+                } .otherwise { // Allocator not ready, need to wait
+                    dprintf(p"[s_fp_add_pipe] Allocator not ready. Transitioning to s_wait_alloc.\n")
+                    state                   := s_wait_alloc // Go to waiting state
+                }
+                // Reset counter regardless of next state
                 dmaWordCount            := 0.U
             }.otherwise {
                 // Final level - send response directly without storing
@@ -578,6 +653,24 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         }
     }
 
+    .elsewhen(state === s_wait_alloc) {
+        io.out.valid := false.B // Ensure no output during wait
+
+        when(foundBlockValid) {
+            dprintf(p"[s_wait_alloc] Allocator ready! Latching block ${foundBlockIndex} and proceeding to DMA write.\n")
+            // Consume the block info
+            blockIndexToWriteReg    := foundBlockIndex
+            foundBlockValid         := false.B
+            allocSearchPtr          := foundBlockIndex + 1.U
+
+            // Transition to DMA write (already set up counters and flags in previous state)
+            state                   := s_dma_write
+        } .otherwise {
+            // Stay in this state, keep waiting
+            state := s_wait_alloc
+        }
+    }
+
     .elsewhen(state === s_send_meta) {
         io.out.valid            := true.B
         outgoing_bits.data      := outgoingMetadataWord
@@ -588,6 +681,16 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Mark chunk as complete and start sending response
             // Note: chunkProcessedBits is set here because last packet don't go to DMA Write and all packets come here.
             chunkProcessedBits(currentLevelReg)(chunkIndexReg) := true.B
+            
+            // Invalidate background search if it was pointing to this chunk
+            when(foundChunkValid && foundChunkLevel === currentLevelReg && foundChunkIndex === chunkIndexReg) {
+                foundChunkValid := false.B
+                dprintf(p"[s_send_meta] Invalidated background search result for L${currentLevelReg}C${chunkIndexReg}\n")
+            }
+            
+            // Clear processing flag when chunk is complete
+            isProcessing := false.B
+            
             dprintf(p"[s_send_meta] OUT META: nextLevel=${nextLevel}, maxLevel=${maxLevelReg}, op=${operationReg}, type=${collectiveTypeReg}, collId=0x${Hexadecimal(collectiveIdReg)}\n")
             state                   := s_send_meta2
         }.elsewhen(io.out.valid && !io.out.ready) {
@@ -655,6 +758,14 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 }
                 
                 // Continue checking for more chunks to process
+                // Fast-track check: Does completing this chunk enable the next level?
+                val nextLevelChunkProcessable = (nextLevel < MAX_RECURSION_LEVEL.U) && canProcessChunk(nextLevel, chunkIndexReg)
+                when(nextLevelChunkProcessable) {
+                    dprintf(p"[s_send_data] FAST-TRACK: Completing L${currentLevelReg}C${chunkIndexReg} enables next level L${nextLevel}C${chunkIndexReg}\n")
+                    fastTrackValid          := true.B
+                    fastTrackLevel          := nextLevel
+                    fastTrackChunk          := chunkIndexReg
+                }
                 state               := s_check_chunks
                 sentDataWordCount   := 0.U
             }.otherwise {
@@ -674,69 +785,105 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         // Check for chunks that are ready to be processed
         io.out.valid        := false.B
         
-        val foundChunk      = Wire(Bool())
-        val foundLevel      = Wire(UInt(outer.params.levelCountBits.W))
-        val foundChunkIndex = Wire(UInt(CHUNK_INDEX_BITS.W))
-        
-        // Create a vector to collect all valid candidates, then pick the first one
-        val validCandidates = Wire(Vec(MAX_RECURSION_LEVEL * MAX_CHUNKS, Bool()))
-        val candidateLevel  = Wire(Vec(MAX_RECURSION_LEVEL * MAX_CHUNKS, UInt(outer.params.levelCountBits.W)))
-        val candidateChunk  = Wire(Vec(MAX_RECURSION_LEVEL * MAX_CHUNKS, UInt(CHUNK_INDEX_BITS.W)))
-        
-        // Initialize all candidates as invalid
-        for (i <- 0 until (MAX_RECURSION_LEVEL * MAX_CHUNKS)) {
-            validCandidates(i)  := false.B
-            candidateLevel(i)   := 0.U
-            candidateChunk(i)   := 0.U
-        }
-        
-        // Priority: process lower levels first, then lower chunk indices
-        // Note: Level 0 is handled directly in s_recv_data, so we start from Level 1
-        var candidateIndex  = 0
-        for (level <- 1 until MAX_RECURSION_LEVEL) {
-            for (chunk <- 0 until MAX_CHUNKS) {
-                val canProcess = chunk.U < totalChunksForCollective && canProcessChunk(level.U, chunk.U)
-                
-                // --- NEW, CLEANER PRINT LOGIC ---
-                // Only print for the chunks we are actually using in this collective
-                when(chunk.U < totalChunksForCollective) {
-                    dprintf(p"[s_check_chunks] Checking L${level}, C${chunk.U}: canProcess=${canProcess}\n")
-                }
+        // PRIORITY 1: Fast-track chunk (immediately processable)
+        when(fastTrackValid) {
+            dprintf(p"[s_check_chunks] FAST-TRACK: Processing chunk C${fastTrackChunk} at level ${fastTrackLevel}\n")
 
-                validCandidates(candidateIndex)     := canProcess
-                candidateLevel(candidateIndex)      := level.U
-                candidateChunk(candidateIndex)      := chunk.U
-                candidateIndex                      += 1
-            }
-        }
-        
-        // Find the first valid candidate (priority encoding)
-        foundChunk          := validCandidates.asUInt.orR
-        foundLevel          := PriorityMux(validCandidates, candidateLevel)
-        foundChunkIndex     := PriorityMux(validCandidates, candidateChunk)
-        
-        when(foundChunk) {
-            dprintf(p"[s_check_chunks] Found processable chunk ${foundChunkIndex} at level ${foundLevel}\n")
+            // Consume the fast-track chunk
+            processingChunkIndex    := fastTrackChunk
+            processingLevel         := fastTrackLevel
+            blockIndexInFlightReg   := incomingChunkBlockIndex(fastTrackLevel)(fastTrackChunk)
+            
+            // Clear fast-track and set processing flag
+            fastTrackValid          := false.B
+            isProcessing            := true.B
 
-            // === OPTIMIZATION: Calculate and store the block index ONCE here ===
-            // Note: For any level > 0, the first read is always the "incoming" data.
-            blockIndexInFlightReg   := incomingChunkBlockIndex(foundLevel)(foundChunkIndex)
-
-            processingChunkIndex    := foundChunkIndex
-            processingLevel         := foundLevel
             isReadingInputData      := true.B
             state                   := s_dma_read
             dmaWordCount            := 0.U
             readWordCount           := 0.U
             readReqCount            := 0.U
-        }.otherwise {
-            dprintf(p"[s_check_chunks] No processable chunks found, returning to idle\n")
-            state                   := s_idle
+            
+        // PRIORITY 2: Background search result
+        } .elsewhen(foundChunkValid) {
+            dprintf(p"[s_check_chunks] BACKGROUND: Processing chunk C${foundChunkIndex} at level ${foundChunkLevel} (from background search)\n")
+
+            // Consume the found chunk
+            processingChunkIndex    := foundChunkIndex
+            processingLevel         := foundChunkLevel
+            blockIndexInFlightReg   := incomingChunkBlockIndex(foundChunkLevel)(foundChunkIndex)
+            
+            // Invalidate the found chunk to re-enable the background search
+            foundChunkValid         := false.B
+            isProcessing            := true.B
+
+            isReadingInputData      := true.B
+            state                   := s_dma_read
+            dmaWordCount            := 0.U
+            readWordCount           := 0.U
+            readReqCount            := 0.U
+            
+        // FALLBACK: No chunks available
+        } .otherwise {
+            dprintf(p"[s_check_chunks] No chunks immediately available. Returning to idle.\n")
+            state := s_idle
+        }
+    }
+
+    // --- Background Memory Block Allocator ---
+    // This runs concurrently and continuously searches for a free memory block
+    // whenever one hasn't already been found and latched.
+    when(!foundBlockValid && numFreeBlocks > 0.U) { // Only search if needed and if blocks are potentially available
+        when(memBlockFree(allocSearchPtr)) {
+            // Found a free block! Latch it and pause searching.
+            foundBlockValid := true.B
+            foundBlockIndex := allocSearchPtr
+            dprintf(p"[BG_ALLOC] Found and latched free block index ${allocSearchPtr}\n")
+        } .otherwise {
+            // Block is busy, move to the next index for the next cycle
+            allocSearchPtr := allocSearchPtr + 1.U // Wraps around automatically
+        }
+    }
+    
+    // --- Background Chunk Searcher ---
+    // This runs concurrently and continuously searches for processable chunks
+    // whenever one hasn't already been found and latched.
+    when(!foundChunkValid && totalChunksForCollective > 0.U) { // Only search if needed and if chunks are potentially available
+        val currentChunkProcessable = chunkSearchChunk < totalChunksForCollective && canProcessChunk(chunkSearchLevel, chunkSearchChunk)
+        val currentlyProcessingThisChunk = isProcessing && (chunkSearchLevel === processingLevel) && (chunkSearchChunk === processingChunkIndex)
+        
+        when(currentChunkProcessable && !currentlyProcessingThisChunk) {
+            // Found a processable chunk that's not currently being processed! Latch it and pause searching.
+            foundChunkValid := true.B
+            foundChunkLevel := chunkSearchLevel
+            foundChunkIndex := chunkSearchChunk
+            dprintf(p"[BG_CHUNK] Found and latched processable chunk C${chunkSearchChunk} at L${chunkSearchLevel}\n")
+        } .otherwise {
+            // Either chunk is not processable OR it's currently being processed - advance search pointer
+            when(currentChunkProcessable && currentlyProcessingThisChunk) {
+                dprintf(p"[BG_CHUNK] Found chunk C${chunkSearchChunk} at L${chunkSearchLevel} but it's currently being processed, skipping\n")
+            }
+            
+            // Advance search pointer
+            val nextChunk = chunkSearchChunk + 1.U
+            when(nextChunk < totalChunksForCollective) {
+                chunkSearchChunk := nextChunk
+            } .otherwise {
+                // Move to next level
+                val nextLevel = chunkSearchLevel + 1.U
+                chunkSearchChunk := 0.U
+                when(nextLevel < MAX_RECURSION_LEVEL.U) {
+                    chunkSearchLevel := nextLevel
+                } .otherwise {
+                    // Wrap around to level 1 (level 0 is handled directly in s_recv_data)
+                    chunkSearchLevel := 1.U
+                }
+            }
         }
     }
     
     // --- Input Ready Logic ---
-    val memoryHasSpace = memBlockFree.asUInt.orR
+    val memoryHasSpace = numFreeBlocks > 0.U
     io.in.ready     := (state === s_idle || state === s_recv_meta2 || state === s_recv_data) && memoryHasSpace
 
     // --- Debug ---
