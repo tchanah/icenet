@@ -66,19 +66,18 @@ class RecursiveDoublingWithDMA(val params: RecursiveDoublingWithDMAParams)(impli
 }
 
 class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends LazyModuleImp(outer) {
-    val io      = IO(new StreamIO(outer.params.dataWidth))
+    val io                      = IO(new StreamIO(outer.params.dataWidth))
     // Elabor-time debug helper (no hardware cost when disabled)
     private val dbgEnabled: Boolean = outer.params.EnableDebug
     @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
     
     // Get the TileLink client interface
-    val (tl, edge) = outer.node.out(0)
+    val (tl, edge)              = outer.node.out(0)
 
     // --- FPU Instantiation ---
     // Instantiate a single-precision floating-point adder.
     // Single precision: exponent = 8, significand = 24 (23 stored + 1 implicit)
-    val fpAdder = Module(new AddRecFN(expWidth = 8, sigWidth = 24))
-    val FPU_LATENCY = 5 // Example latency, check the FPU documentation for exact value
+    val fpAdder                 = Module(new AddRecFN(expWidth = 8, sigWidth = 24))
 
     // Provide default values to prevent "not fully initialized" errors.
     // These will be overridden when the FSM is in the s_fp_add_pipe state.
@@ -109,24 +108,23 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // Buffer for data read from memory
     val memoryReadBuffer        = Reg(Vec(NUM_DATA_ELEMENTS, UInt(ELEMENT_WIDTH.W)))
     // Separate buffer for buffered packet data to avoid conflicts
-    // Buffer for processed data to be written to memory
-    val processedDataBuffer     = RegInit(VecInit(Seq.fill(NUM_DATA_ELEMENTS)(0.U(ELEMENT_WIDTH.W))))
+    // Buffer for processed data to be written to memory (no global reset init)
+    val processedDataBuffer     = Reg(Vec(NUM_DATA_ELEMENTS, UInt(ELEMENT_WIDTH.W)))
     
     // --- Chunk Management ---
     // Track total chunks for current collective operation
     val totalChunksForCollective = RegInit(0.U(CHUNK_INDEX_BITS.W))
     
-    // Chunk arrival tracking per level (bit vector indicating which chunks have arrived)
-    // Using a memory-efficient representation: each level has a bit vector
-    val chunkArrivedBits        = RegInit(VecInit(Seq.fill(MAX_RECURSION_LEVEL)(VecInit(Seq.fill(MAX_CHUNKS)(false.B)))))
-    
-    // Chunk processing tracking per level (bit vector indicating which chunks have been processed)
-    val chunkProcessedBits      = RegInit(VecInit(Seq.fill(MAX_RECURSION_LEVEL)(VecInit(Seq.fill(MAX_CHUNKS)(false.B)))))
+    // Chunk arrival and processing tracking per level using bitmaps (UInt)
+    // Each level has a bitmap of MAX_CHUNKS bits.
+    // Use plain Reg (no RegInit) to avoid huge aggregate constant in reset; we clear explicitly on new collective.
+    val chunkArrivedBitmap      = Reg(Vec(MAX_RECURSION_LEVEL, UInt(MAX_CHUNKS.W)))
+    val chunkProcessedBitmap    = Reg(Vec(MAX_RECURSION_LEVEL, UInt(MAX_CHUNKS.W)))
 
     // --- Dynamic Memory Management ---
     val NUM_MEM_BLOCKS          = outer.params.numMemoryBlocks
-    // A bitmap to track free 1KB blocks in the RAM. true = free.
-    val memBlockFree            = RegInit(VecInit(Seq.fill(NUM_MEM_BLOCKS)(true.B)))
+    // Free-block bitmap: 1 = free, 0 = allocated. No reset init; cleared at runtime on new collective.
+    val memFreeBitmap           = Reg(UInt(NUM_MEM_BLOCKS.W))
     val BLOCK_INDEX_BITS        = log2Ceil(NUM_MEM_BLOCKS)
     val numFreeBlocks           = RegInit(NUM_MEM_BLOCKS.U((BLOCK_INDEX_BITS + 1).W))
     val allocSearchPtr          = RegInit(0.U(BLOCK_INDEX_BITS.W))
@@ -147,8 +145,12 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val fastTrackChunk          = Reg(UInt(CHUNK_INDEX_BITS.W))
 
     // Tables to store the block index for each chunk's data
-    val incomingChunkBlockIndex = Reg(Vec(MAX_RECURSION_LEVEL, Vec(MAX_CHUNKS, UInt(BLOCK_INDEX_BITS.W))))
-    val processedChunkBlockIndex = Reg(Vec(MAX_RECURSION_LEVEL, Vec(MAX_CHUNKS, UInt(BLOCK_INDEX_BITS.W))))
+    // Packed per-level fields to avoid large Vec-of-Vec structures
+    // Each level holds MAX_CHUNKS fields of width BLOCK_INDEX_BITS
+    private val BLOCK_FIELDS_PER_LEVEL_WIDTH = (MAX_CHUNKS * BLOCK_INDEX_BITS)
+    private val SHAMT_BITS      = log2Ceil(BLOCK_FIELDS_PER_LEVEL_WIDTH)
+    val incomingBlockFields     = Reg(Vec(MAX_RECURSION_LEVEL, UInt(BLOCK_FIELDS_PER_LEVEL_WIDTH.W)))
+    val processedBlockFields    = Reg(Vec(MAX_RECURSION_LEVEL, UInt(BLOCK_FIELDS_PER_LEVEL_WIDTH.W)))
 
     // --- Extended State Machine ---
     val s_idle :: s_recv_meta2 :: s_recv_data :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_wait_alloc :: s_send_meta :: s_send_meta2 :: s_send_data :: s_check_chunks :: Nil = Enum(14)
@@ -219,17 +221,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // Helper function to check if all required chunks are available for processing
     // Note: Level 0 chunks are processed immediately during receive, so this only handles Level 1+
     def canProcessChunk(level: UInt, chunkIndex: UInt): Bool = {
-        val canProcess = Wire(Bool())
-        // For any level > 0, the chunk is processable if:
-        // 1. Its own data has arrived in memory.
-        // 2. The result from the PREVIOUS level is ready.
-        // 3. It has not ALREADY been processed.
-        // 4. Level 0 of this Chunk is already processed
-        canProcess := chunkArrivedBits(level)(chunkIndex) && 
-                      chunkProcessedBits(level - 1.U)(chunkIndex) &&
-                      !chunkProcessedBits(level)(chunkIndex) &&
-                      chunkProcessedBits(0.U)(chunkIndex)
-        canProcess
+        val bitIdx                 = chunkIndex(CHUNK_INDEX_BITS-1, 0)
+        val mask                   = (1.U(MAX_CHUNKS.W)) << bitIdx
+        val arrivedBit             = (chunkArrivedBitmap(level) & mask) =/= 0.U
+        val prevLevelProcessedBit  = (chunkProcessedBitmap(level - 1.U) & mask) =/= 0.U
+        val thisLevelProcessedBit  = (chunkProcessedBitmap(level) & mask) =/= 0.U
+        val level0ProcessedBit     = (chunkProcessedBitmap(0.U) & mask) =/= 0.U
+        arrivedBit && prevLevelProcessedBit && !thisLevelProcessedBit && level0ProcessedBit
     }
 
     // --- Metadata Assembly ---
@@ -254,8 +252,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         
         when(incoming_fire) {
             dprintf(p"[s_idle] Received metadata: level=${incoming_bits.data(63, 56)}, maxLevel=${incoming_bits.data(55, 48)}, collId=0x${Hexadecimal(incoming_bits.data(15, 0))}\n")
-            val metaWord        = incoming_bits.data
-            val newCollectiveId = metaWord(15, 0)
+            val metaWord            = incoming_bits.data
+            val newCollectiveId     = metaWord(15, 0)
             
             // Clear memory valid flags if this is a new test set (different collective ID)
             when(newCollectiveId =/= collectiveIdReg) {
@@ -263,15 +261,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
                 totalChunksForCollective := 0.U
                 
-                // Clear chunk tracking for new collective
+                // Clear chunk tracking for new collective (bitmap form)
                 for (level <- 0 until MAX_RECURSION_LEVEL) {
-                    for (chunk <- 0 until MAX_CHUNKS) {
-                        chunkArrivedBits(level)(chunk)      := false.B
-                        chunkProcessedBits(level)(chunk)    := false.B
-                    }
+                    chunkArrivedBitmap(level)   := 0.U
+                    chunkProcessedBitmap(level) := 0.U
                 }
                 // Mark all memory blocks as free for the new collective
-                for (i <- 0 until NUM_MEM_BLOCKS) { memBlockFree(i) := true.B }
+                memFreeBitmap := (~0.U(NUM_MEM_BLOCKS.W))
                 dprintf(p"[s_idle] Resetting memory manager: all ${NUM_MEM_BLOCKS} blocks are now free.\n")
 
                 numFreeBlocks           := NUM_MEM_BLOCKS.U
@@ -286,14 +282,14 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 fastTrackValid          := false.B
             }
             
-            collectiveIdReg     := newCollectiveId
-            collectiveTypeReg   := metaWord(23, 16)
-            operationReg        := metaWord(31, 24)
-            maxLevelReg         := metaWord(55, 48)
-            currentLevelReg     := metaWord(63, 56)
+            collectiveIdReg         := newCollectiveId
+            collectiveTypeReg       := metaWord(23, 16)
+            operationReg            := metaWord(31, 24)
+            maxLevelReg             := metaWord(55, 48)
+            currentLevelReg         := metaWord(63, 56)
             
             // Transition to wait for the second metadata word
-            state               := s_recv_meta2
+            state                   := s_recv_meta2
             
         // PRIORITY 2: No incoming packet, but the background search found a chunk.
         } .elsewhen(foundChunkValid) {
@@ -302,7 +298,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Consume the found chunk
             processingLevel         := foundChunkLevel
             processingChunkIndex    := foundChunkIndex
-            blockIndexInFlightReg   := incomingChunkBlockIndex(foundChunkLevel)(foundChunkIndex)
+            // Extract incoming block index for this level/chunk (packed fields)
+            blockIndexInFlightReg   := (incomingBlockFields(foundChunkLevel) >> (foundChunkIndex * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
             
             // Invalidate the found chunk to re-enable the background search.
             foundChunkValid         := false.B
@@ -346,10 +343,10 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 when((baseElementIndex + i.U) < NUM_DATA_ELEMENTS.U) {
                     when(currentLevelReg === 0.U) {
                         // Level 0: Write directly to processedDataBuffer (no processing needed)
-                        processedDataBuffer(baseElementIndex + i.U) := incoming_bits.data((i + 1) * ELEMENT_WIDTH - 1, i * ELEMENT_WIDTH)
+                        processedDataBuffer(baseElementIndex + i.U)     := incoming_bits.data((i + 1) * ELEMENT_WIDTH - 1, i * ELEMENT_WIDTH)
                     }.otherwise {
                         // Higher levels: Write to incomingDataBuffer (will be processed later)
-                        incomingDataBuffer(baseElementIndex + i.U) := incoming_bits.data((i + 1) * ELEMENT_WIDTH - 1, i * ELEMENT_WIDTH)
+                        incomingDataBuffer(baseElementIndex + i.U)      := incoming_bits.data((i + 1) * ELEMENT_WIDTH - 1, i * ELEMENT_WIDTH)
                     }
                 }
             }
@@ -419,15 +416,34 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             when(tl.a.fire) {
                 // On the first word, update the memory management tables
                 when(dmaWordCount === 0.U) {
-                    memBlockFree(blockIndexToWriteReg)  := false.B
+                    // Mark allocated block as busy in bitmap
+                    {
+                        val idx         = blockIndexToWriteReg(BLOCK_INDEX_BITS-1, 0)
+                        val mask        = (1.U(NUM_MEM_BLOCKS.W)) << idx
+                        memFreeBitmap   := memFreeBitmap & (~mask)
+                    }
                     numFreeBlocks                       := numFreeBlocks - 1.U
                     dprintf(p"[s_dma_write] Decremented free blocks to ${numFreeBlocks - 1.U}\n")
 
                     when(isStoringIncomingData) {
-                        incomingChunkBlockIndex(currentLevelReg)(chunkIndexReg) := blockIndexToWriteReg
+                        // Write incoming block index field into packed vector
+                        val cur      = incomingBlockFields(currentLevelReg)
+                        val shamtRaw = (chunkIndexReg(CHUNK_INDEX_BITS-1, 0) * BLOCK_INDEX_BITS.U)
+                        val shamt    = shamtRaw(SHAMT_BITS-1, 0)
+                        val mask     = ~(((BigInt(1) << BLOCK_INDEX_BITS) - 1).U(BLOCK_FIELDS_PER_LEVEL_WIDTH.W) << shamt)
+                        val zext     = Cat(0.U((BLOCK_FIELDS_PER_LEVEL_WIDTH - BLOCK_INDEX_BITS).W), blockIndexToWriteReg.asUInt)
+                        val insert   = (zext << shamt)
+                        incomingBlockFields(currentLevelReg) := (cur & mask) | insert
                         dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for INCOMING L${currentLevelReg}C${chunkIndexReg}\n")
                     }.otherwise {
-                        processedChunkBlockIndex(currentLevelReg)(chunkIndexReg) := blockIndexToWriteReg
+                        // Write processed block index field into packed vector
+                        val cur      = processedBlockFields(currentLevelReg)
+                        val shamtRaw = (chunkIndexReg(CHUNK_INDEX_BITS-1, 0) * BLOCK_INDEX_BITS.U)
+                        val shamt    = shamtRaw(SHAMT_BITS-1, 0)
+                        val mask     = ~(((BigInt(1) << BLOCK_INDEX_BITS) - 1).U(BLOCK_FIELDS_PER_LEVEL_WIDTH.W) << shamt)
+                        val zext     = Cat(0.U((BLOCK_FIELDS_PER_LEVEL_WIDTH - BLOCK_INDEX_BITS).W), blockIndexToWriteReg.asUInt)
+                        val insert   = (zext << shamt)
+                        processedBlockFields(currentLevelReg) := (cur & mask) | insert
                         dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for PROCESSED L${currentLevelReg}C${chunkIndexReg}\n")
                     }
                 }
@@ -461,7 +477,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 when(isStoringIncomingData) {
                     // The chunk data is now officially in memory.
                     // THIS is the correct place to set the arrived flag.
-                    chunkArrivedBits(currentLevelReg)(chunkIndexReg) := true.B
+                    {
+                        val bitIdx  = chunkIndexReg(CHUNK_INDEX_BITS-1, 0)
+                        val bitMask = (1.U(MAX_CHUNKS.W)) << bitIdx
+                        chunkArrivedBitmap(currentLevelReg) := chunkArrivedBitmap(currentLevelReg) | bitMask
+                    }
                     dprintf(p"[s_wait_write] Incoming Level ${currentLevelReg} Chunk ${chunkIndexReg} stored\n")
 
                     // Just stored incoming data - now check if processing is possible
@@ -554,7 +574,12 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             }.otherwise {
                 // Read phase complete. The data is now in internal buffers, so we can free the memory block.
                 // The block index was latched during the read request. Use the registered value.
-                memBlockFree(blockIndexInFlightReg) := true.B
+                // Mark block as free again after read complete
+                {
+                    val idx  = blockIndexInFlightReg(BLOCK_INDEX_BITS-1, 0)
+                    val mask = (1.U(NUM_MEM_BLOCKS.W)) << idx
+                    memFreeBitmap := memFreeBitmap | mask
+                }
                 numFreeBlocks                       := numFreeBlocks + 1.U
                 dprintf(p"[s_wait_read] Read complete. Freed block ${blockIndexInFlightReg}. Free blocks: ${numFreeBlocks + 1.U}\n")
 
@@ -565,7 +590,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     dprintf(p"[s_wait_read] Input data read complete, starting previous level read\n")
 
                     // Calculate and store the NEXT block index for the second read phase
-                    blockIndexInFlightReg   := processedChunkBlockIndex(processingLevel - 1.U)(processingChunkIndex)
+                    blockIndexInFlightReg   := (processedBlockFields(processingLevel - 1.U) >> (processingChunkIndex * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
 
                     isReadingInputData  := false.B
                     readWordCount       := 0.U
@@ -600,8 +625,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     
     .elsewhen(state === s_fp_add_pipe) {
         // ACTION: Provide inputs, calculate sum, and store the result in the same cycle.
-        fpAdder.io.a    := incomingDataBuffer(elementIdx)
-        fpAdder.io.b    := memoryReadBuffer(elementIdx)
+        // Convert IEEE-754 inputs to HardFloat recoded format (combinational helpers)
+        val aRec        = hardfloat.recFNFromFN(8, 24, incomingDataBuffer(elementIdx))
+        val bRec        = hardfloat.recFNFromFN(8, 24, memoryReadBuffer(elementIdx))
+        fpAdder.io.a    := aRec
+        fpAdder.io.b    := bRec
         
         // Set control signals
         fpAdder.io.roundingMode   := "b000".U
@@ -609,8 +637,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         fpAdder.io.subOp          := false.B
 
         // Since the FPU is combinational, the result is available immediately.
-        val sum         = fpAdder.io.out
-        // Always store to processedDataBuffer for immediate use
+        val sumRec      = fpAdder.io.out
+        val sum         = hardfloat.fNFromRecFN(8, 24, sumRec)
+        // Always store IEEE result to processedDataBuffer for immediate use
         processedDataBuffer(elementIdx) := sum
 
         // TRANSITION: When the last element is processed, move to the next state.
@@ -679,8 +708,12 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
         when(io.out.fire) {
             // Mark chunk as complete and start sending response
-            // Note: chunkProcessedBits is set here because last packet don't go to DMA Write and all packets come here.
-            chunkProcessedBits(currentLevelReg)(chunkIndexReg) := true.B
+            // Note: set processed bit here (responses do not go to DMA write)
+            {
+                val bitIdx  = chunkIndexReg(CHUNK_INDEX_BITS-1, 0)
+                val bitMask = (1.U(MAX_CHUNKS.W)) << bitIdx
+                chunkProcessedBitmap(currentLevelReg) := chunkProcessedBitmap(currentLevelReg) | bitMask
+            }
             
             // Invalidate background search if it was pointing to this chunk
             when(foundChunkValid && foundChunkLevel === currentLevelReg && foundChunkIndex === chunkIndexReg) {
@@ -792,7 +825,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Consume the fast-track chunk
             processingChunkIndex    := fastTrackChunk
             processingLevel         := fastTrackLevel
-            blockIndexInFlightReg   := incomingChunkBlockIndex(fastTrackLevel)(fastTrackChunk)
+            blockIndexInFlightReg   := (incomingBlockFields(fastTrackLevel) >> (fastTrackChunk * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
             
             // Clear fast-track and set processing flag
             fastTrackValid          := false.B
@@ -811,7 +844,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Consume the found chunk
             processingChunkIndex    := foundChunkIndex
             processingLevel         := foundChunkLevel
-            blockIndexInFlightReg   := incomingChunkBlockIndex(foundChunkLevel)(foundChunkIndex)
+            blockIndexInFlightReg   := (incomingBlockFields(foundChunkLevel) >> (foundChunkIndex * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
             
             // Invalidate the found chunk to re-enable the background search
             foundChunkValid         := false.B
@@ -834,7 +867,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // This runs concurrently and continuously searches for a free memory block
     // whenever one hasn't already been found and latched.
     when(!foundBlockValid && numFreeBlocks > 0.U) { // Only search if needed and if blocks are potentially available
-        when(memBlockFree(allocSearchPtr)) {
+        val probeIdx  = allocSearchPtr(BLOCK_INDEX_BITS-1, 0)
+        val probeMask = (1.U(NUM_MEM_BLOCKS.W)) << probeIdx
+        when((memFreeBitmap & probeMask) =/= 0.U) {
             // Found a free block! Latch it and pause searching.
             foundBlockValid := true.B
             foundBlockIndex := allocSearchPtr
