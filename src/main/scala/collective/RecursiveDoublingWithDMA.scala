@@ -66,13 +66,24 @@ class RecursiveDoublingWithDMA(val params: RecursiveDoublingWithDMAParams)(impli
 }
 
 class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends LazyModuleImp(outer) {
-    val io                      = IO(new StreamIO(outer.params.dataWidth))
+    val io                      = IO(new Bundle {
+        val in = Flipped(Decoupled(new StreamChannel(outer.params.dataWidth)))
+        val out = Decoupled(new StreamChannel(outer.params.dataWidth))
+        val dstMacAddr = Output(UInt(IceNetConsts.ETH_MAC_BITS.W))  // Destination MAC for outgoing packets
+        val level0SrcMac = Input(UInt(IceNetConsts.ETH_MAC_BITS.W))  // Source MAC from Level 0 packets (for Level 4 destination)
+    })
     // Elabor-time debug helper (no hardware cost when disabled)
     private val dbgEnabled: Boolean = outer.params.EnableDebug
     @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
     
     // Get the TileLink client interface
     val (tl, edge)              = outer.node.out(0)
+    
+    // --- Node Rank Calculation ---
+    // Get node rank from MAC address (last byte) or PlusArg
+    // MAC format: 00:12:6D:00:00:XX where XX is the rank
+    // Using PlusArg as fallback if MAC doesn't follow pattern
+    val myRank = PlusArg("node_rank", default = 0, docstring = "Node rank (0-7 for 8 nodes)", width = 8)
 
     // --- FPU Instantiation ---
     // Instantiate a single-precision floating-point adder.
@@ -138,11 +149,6 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val foundChunkLevel         = Reg(UInt(outer.params.levelCountBits.W))
     val foundChunkIndex         = Reg(UInt(CHUNK_INDEX_BITS.W))
     val isProcessing            = RegInit(false.B)
-    
-    // Fast-track processing state
-    val fastTrackValid          = RegInit(false.B)
-    val fastTrackLevel          = Reg(UInt(outer.params.levelCountBits.W))
-    val fastTrackChunk          = Reg(UInt(CHUNK_INDEX_BITS.W))
 
     // Tables to store the block index for each chunk's data
     // Packed per-level fields to avoid large Vec-of-Vec structures
@@ -153,7 +159,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val processedBlockFields    = Reg(Vec(MAX_RECURSION_LEVEL, UInt(BLOCK_FIELDS_PER_LEVEL_WIDTH.W)))
 
     // --- Extended State Machine ---
-    val s_idle :: s_recv_meta2 :: s_recv_data :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_wait_alloc :: s_send_meta :: s_send_meta2 :: s_send_data :: s_check_chunks :: Nil = Enum(14)
+    val s_idle :: s_recv_meta2 :: s_recv_data :: s_dma_write :: s_wait_write :: s_dma_read :: s_wait_read :: s_wait_read_done :: s_fp_add_pipe :: s_wait_alloc :: s_send_meta :: s_send_meta2 :: s_send_data :: Nil = Enum(13)
     val state                   = RegInit(s_idle)
     val prevState               = RegInit(s_idle)
 
@@ -210,6 +216,19 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     
     io.out.bits                 := outgoing_bits
     io.out.valid                := false.B
+    
+    // Destination MAC address for outgoing packets
+    // This is set before packet transmission starts to ensure it's stable
+    val outgoingDstMac           = RegInit(IceNetConsts.ETH_BCAST_MAC)
+    io.dstMacAddr                := outgoingDstMac
+    
+    // Store source MAC from Level 0 packets (from PyTorch)
+    // This will be used as destination for Level 4 packets
+    // Since the NIC strips headers before the accelerator, the harness provides the extracted MAC.
+    // We also allow overriding via PlusArg for deterministic setups.
+    val level0SourceMac          = RegInit(0.U(IceNetConsts.ETH_MAC_BITS.W))
+    val level0SourceMacValid     = RegInit(false.B)
+    val level0SourceMacPlusArg   = PlusArg("pytorch_src_mac", default = 0L, docstring = "PyTorch source MAC address (for Level 4 routing)", width = 48)
 
     // --- TileLink Default Signals ---
     tl.a.valid                  := false.B
@@ -230,12 +249,27 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         arrivedBit && prevLevelProcessedBit && !thisLevelProcessedBit && level0ProcessedBit
     }
 
+    // --- Partner Calculation ---
+    // Calculate partner rank for recursive doubling: partner = myRank XOR (1 << level)
+    def calculatePartnerRank(level: UInt, rank: UInt): UInt = {
+        val distance = 1.U << level
+        rank ^ distance
+    }
+    
+    // Calculate partner MAC address (base MAC 00:12:6D:00:00:00 + partner rank)
+    def calculatePartnerMac(level: UInt, rank: UInt): UInt = {
+        val partnerRank = calculatePartnerRank(level, rank)
+        val baseMac = (0x00126D000000L).U(48.W)  // Base: 00:12:6D:00:00:00
+        baseMac | partnerRank(7, 0)
+    }
+    
     // --- Metadata Assembly ---
+    // Include sender rank in reserved byte for partner verification
     val outgoingMetadataWord = Wire(UInt(outer.params.dataWidth.W))
     outgoingMetadataWord := Cat(
         nextLevel(7,0),
         maxLevelReg(7,0),
-        0.U(8.W),
+        myRank(7,0),        // Sender rank in reserved byte (for partner verification)
         0.U(8.W),
         operationReg,
         collectiveTypeReg,
@@ -254,6 +288,46 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             dprintf(p"[s_idle] Received metadata: level=${incoming_bits.data(63, 56)}, maxLevel=${incoming_bits.data(55, 48)}, collId=0x${Hexadecimal(incoming_bits.data(15, 0))}\n")
             val metaWord            = incoming_bits.data
             val newCollectiveId     = metaWord(15, 0)
+            val senderRank          = metaWord(47, 40)  // Extract sender rank from reserved byte
+            val receivedLevel       = metaWord(63, 56)
+            
+            // Store source MAC from Level 0 packets (from PyTorch)
+            // This will be used as destination for Level 4 packets (final result)
+            // Store it when we receive Level 0 and either the collective ID changed or we haven't captured one yet.
+            when(receivedLevel === 0.U && (newCollectiveId =/= collectiveIdReg || !level0SourceMacValid)) {
+                val plusArgProvided   = level0SourceMacPlusArg.orR
+                val connectorProvided = io.level0SrcMac.orR
+
+                when(plusArgProvided) {
+                    level0SourceMac := level0SourceMacPlusArg
+                    level0SourceMacValid := true.B
+                    dprintf(p"[s_idle] Level 0 packet: storing source MAC from PlusArg=0x${Hexadecimal(level0SourceMacPlusArg)} for Level 4 destination\n")
+                }.elsewhen(connectorProvided) {
+                    level0SourceMac := io.level0SrcMac
+                    level0SourceMacValid := true.B
+                    dprintf(p"[s_idle] Level 0 packet: storing source MAC from extractor=0x${Hexadecimal(io.level0SrcMac)} for Level 4 destination\n")
+                }.otherwise {
+                    // No new MAC provided; retain prior value but warn if none captured yet.
+                    when(!level0SourceMacValid) {
+                        dprintf(p"[s_idle] WARNING: Level 0 packet arrived but no source MAC available. Continuing with 0x${Hexadecimal(level0SourceMac)}\n")
+                    }
+                }
+            }
+            
+            // Verify packet source based on level
+            // Level 0: From PyTorch/external (no partner verification needed)
+            // Level 1-4: From partner node (verify sender matches expected partner)
+            when(receivedLevel > 0.U) {
+                // For levels 1-4, calculate expected partner from previous level
+                // If we're at level L, we expect packet from the partner we sent to at level L-1
+                val expectedPartnerRank = calculatePartnerRank(receivedLevel - 1.U, myRank)
+                when(senderRank === expectedPartnerRank) {
+                    dprintf(p"[s_idle] Packet from expected partner rank=${senderRank} at level=${receivedLevel}\n")
+                }.otherwise {
+                    dprintf(p"[s_idle] WARNING: Packet from unexpected sender. Level=${receivedLevel}, expected rank=${expectedPartnerRank}, got ${senderRank}\n")
+                    // Still process - might be from different collective or out-of-order
+                }
+            }
             
             // Clear memory valid flags if this is a new test set (different collective ID)
             when(newCollectiveId =/= collectiveIdReg) {
@@ -279,7 +353,6 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 chunkSearchChunk        := 0.U
                 foundChunkValid         := false.B
                 isProcessing            := false.B
-                fastTrackValid          := false.B
             }
             
             collectiveIdReg         := newCollectiveId
@@ -491,11 +564,18 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     val incomingChunkProcessable = canProcessChunk(currentLevelReg, chunkIndexReg)
                     when(incomingChunkProcessable) {
                         dprintf(p"[s_wait_write] FAST-TRACK: Incoming chunk L${currentLevelReg}C${chunkIndexReg} is immediately processable\n")
-                        fastTrackValid          := true.B
-                        fastTrackLevel          := currentLevelReg
-                        fastTrackChunk          := chunkIndexReg
+                        // Set up for immediate processing
+                        processingChunkIndex    := chunkIndexReg
+                        processingLevel         := currentLevelReg
+                        blockIndexInFlightReg   := (incomingBlockFields(currentLevelReg) >> (chunkIndexReg * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
+                        isProcessing            := true.B
+                        isReadingInputData      := true.B
+                        readWordCount           := 0.U
+                        readReqCount            := 0.U
+                        state                   := s_dma_read
+                    }.otherwise {
+                        state                   := s_idle
                     }
-                    state                   := s_check_chunks
                 }.otherwise {
                     dprintf(p"[s_wait_write] Processed Level ${currentLevelReg} Chunk ${chunkIndexReg} stored\n")
                     
@@ -724,7 +804,32 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Clear processing flag when chunk is complete
             isProcessing := false.B
             
-            dprintf(p"[s_send_meta] OUT META: nextLevel=${nextLevel}, maxLevel=${maxLevelReg}, op=${operationReg}, type=${collectiveTypeReg}, collId=0x${Hexadecimal(collectiveIdReg)}\n")
+            // Calculate partner for routing
+            // Note: Module never sends Level 0 (only receives it from PyTorch)
+            // Module sends Level 1-4:
+            //   - Level 1-3: Send to partner node (intermediate levels)
+            //   - Level 4: Send back to PyTorch/external (final result)
+            val partnerRank = calculatePartnerRank(currentLevelReg, myRank)
+            val partnerMac = calculatePartnerMac(currentLevelReg, myRank)
+            
+            // Set destination MAC for this packet
+            // Level 1-3: Send to partner node
+            // Level 4: Send back to Level 0 source (PyTorch) using stored MAC (fallback to broadcast if unknown)
+            val dstMacForPacket = Mux(currentLevelReg < maxLevelReg, 
+                                     partnerMac, 
+                                     Mux(level0SourceMacValid, level0SourceMac, IceNetConsts.ETH_BCAST_MAC))
+            // Set destination MAC BEFORE packet transmission starts
+            // This ensures it's stable when the header prepender captures it
+            outgoingDstMac := dstMacForPacket
+            
+            // Debug output for routing
+            when(currentLevelReg < maxLevelReg) {
+                dprintf(p"[s_send_meta] Intermediate level ${currentLevelReg}: sending to partner rank=${partnerRank}, partner MAC=0x${Hexadecimal(partnerMac)}\n")
+            }.otherwise {
+                dprintf(p"[s_send_meta] Final level ${currentLevelReg}: sending result back to Level 0 source (PyTorch), dest MAC=0x${Hexadecimal(dstMacForPacket)} (valid=${level0SourceMacValid})\n")
+            }
+            
+            dprintf(p"[s_send_meta] OUT META: nextLevel=${nextLevel}, maxLevel=${maxLevelReg}, myRank=${myRank}, op=${operationReg}, type=${collectiveTypeReg}, collId=0x${Hexadecimal(collectiveIdReg)}\n")
             state                   := s_send_meta2
         }.elsewhen(io.out.valid && !io.out.ready) {
             // Track when output is not ready
@@ -748,7 +853,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             if (NUM_DATA_WORDS > 0) {
                 state   := s_send_data
             } else {
-                state   := s_check_chunks
+                state   := s_idle
             }
         }.elsewhen(io.out.valid && !io.out.ready) {
             // Track when output is not ready
@@ -795,11 +900,18 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 val nextLevelChunkProcessable = (nextLevel < MAX_RECURSION_LEVEL.U) && canProcessChunk(nextLevel, chunkIndexReg)
                 when(nextLevelChunkProcessable) {
                     dprintf(p"[s_send_data] FAST-TRACK: Completing L${currentLevelReg}C${chunkIndexReg} enables next level L${nextLevel}C${chunkIndexReg}\n")
-                    fastTrackValid          := true.B
-                    fastTrackLevel          := nextLevel
-                    fastTrackChunk          := chunkIndexReg
+                    // Set up for immediate processing
+                    processingChunkIndex    := chunkIndexReg
+                    processingLevel         := nextLevel
+                    blockIndexInFlightReg   := (incomingBlockFields(nextLevel) >> (chunkIndexReg * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
+                    isProcessing            := true.B
+                    isReadingInputData      := true.B
+                    readWordCount           := 0.U
+                    readReqCount            := 0.U
+                    state                   := s_dma_read
+                }.otherwise {
+                    state                   := s_idle
                 }
-                state               := s_check_chunks
                 sentDataWordCount   := 0.U
             }.otherwise {
                 sentDataWordCount   := sentDataWordCount + 1.U
@@ -814,54 +926,6 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         // Stay in this state until the current word is accepted
     }
     
-    .elsewhen(state === s_check_chunks) {
-        // Check for chunks that are ready to be processed
-        io.out.valid        := false.B
-        
-        // PRIORITY 1: Fast-track chunk (immediately processable)
-        when(fastTrackValid) {
-            dprintf(p"[s_check_chunks] FAST-TRACK: Processing chunk C${fastTrackChunk} at level ${fastTrackLevel}\n")
-
-            // Consume the fast-track chunk
-            processingChunkIndex    := fastTrackChunk
-            processingLevel         := fastTrackLevel
-            blockIndexInFlightReg   := (incomingBlockFields(fastTrackLevel) >> (fastTrackChunk * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
-            
-            // Clear fast-track and set processing flag
-            fastTrackValid          := false.B
-            isProcessing            := true.B
-
-            isReadingInputData      := true.B
-            state                   := s_dma_read
-            dmaWordCount            := 0.U
-            readWordCount           := 0.U
-            readReqCount            := 0.U
-            
-        // PRIORITY 2: Background search result
-        } .elsewhen(foundChunkValid) {
-            dprintf(p"[s_check_chunks] BACKGROUND: Processing chunk C${foundChunkIndex} at level ${foundChunkLevel} (from background search)\n")
-
-            // Consume the found chunk
-            processingChunkIndex    := foundChunkIndex
-            processingLevel         := foundChunkLevel
-            blockIndexInFlightReg   := (incomingBlockFields(foundChunkLevel) >> (foundChunkIndex * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
-            
-            // Invalidate the found chunk to re-enable the background search
-            foundChunkValid         := false.B
-            isProcessing            := true.B
-
-            isReadingInputData      := true.B
-            state                   := s_dma_read
-            dmaWordCount            := 0.U
-            readWordCount           := 0.U
-            readReqCount            := 0.U
-            
-        // FALLBACK: No chunks available
-        } .otherwise {
-            dprintf(p"[s_check_chunks] No chunks immediately available. Returning to idle.\n")
-            state := s_idle
-        }
-    }
 
     // --- Background Memory Block Allocator ---
     // This runs concurrently and continuously searches for a free memory block
@@ -905,10 +969,10 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 chunkSearchChunk := nextChunk
             } .otherwise {
                 // Move to next level
-                val nextLevel = chunkSearchLevel + 1.U
+                val nextSearchLevel = chunkSearchLevel + 1.U
                 chunkSearchChunk := 0.U
-                when(nextLevel < MAX_RECURSION_LEVEL.U) {
-                    chunkSearchLevel := nextLevel
+                when(nextSearchLevel < MAX_RECURSION_LEVEL.U) {
+                    chunkSearchLevel := nextSearchLevel
                 } .otherwise {
                     // Wrap around to level 1 (level 0 is handled directly in s_recv_data)
                     chunkSearchLevel := 1.U

@@ -1011,9 +1011,13 @@ class RecursiveDoublingWithDMAWrapperModuleImp(outer: RecursiveDoublingWithDMAWr
   // Network interface I/O bundle
   // net_in: Receives network packets from the NIC (Flipped because it's an input to this module)
   // net_out: Sends processed packets back to the NIC
+  // dstMacAddr: Destination MAC address for outgoing packets
+  // level0SrcMac: Source MAC from Level 0 packets (for Level 4 destination)
   val io = IO(new Bundle {
     val net_in = Flipped(Decoupled(new StreamChannel(NET_IF_WIDTH)))
     val net_out = Decoupled(new StreamChannel(NET_IF_WIDTH))
+    val dstMacAddr = Output(UInt(ETH_MAC_BITS.W))  // Destination MAC for outgoing packets
+    val level0SrcMac = Input(UInt(ETH_MAC_BITS.W))  // Source MAC extracted from incoming packets
   })
   
   // Get the actual hardware module instance of the RecursiveDoublingWithDMA accelerator
@@ -1027,6 +1031,179 @@ class RecursiveDoublingWithDMAWrapperModuleImp(outer: RecursiveDoublingWithDMAWr
   // This creates the data path for packets flowing in and out of the accelerator
   io.net_in <> recursiveDoublingDMAModule.io.in
   io.net_out <> recursiveDoublingDMAModule.io.out
+  io.dstMacAddr := recursiveDoublingDMAModule.io.dstMacAddr  // Pass destination MAC through
+  recursiveDoublingDMAModule.io.level0SrcMac := io.level0SrcMac  // Deliver Level 0 source MAC to accelerator
+}
+
+
+/**
+ * Ethernet Header Extractor Module
+ * Extracts Ethernet headers from incoming packets and provides the source MAC address.
+ * The Ethernet header words are removed from the stream so the accelerator receives payload only.
+ */
+class EthernetHeaderExtractor(dataWidth: Int, dbgEnabled: Boolean = false) extends Module {
+  val io = IO(new Bundle {
+    val in = Flipped(Decoupled(new StreamChannel(dataWidth)))
+    val out = Decoupled(new StreamChannel(dataWidth))
+    val srcMacAddr = Output(UInt(ETH_MAC_BITS.W))
+  })
+
+  // Debug prints controlled by parent connector
+  @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+
+  val headerWords = ETH_HEAD_BYTES * 8 / dataWidth
+  require(headerWords >= 1, "Ethernet header must span at least one word on the stream interface.")
+
+  val s_idle :: s_header :: s_data :: Nil = Enum(3)
+  val state = RegInit(s_idle)
+  val wordIdx = RegInit(0.U(log2Ceil(headerWords + 1).W))
+  val storedHeaderWords = RegInit(VecInit(Seq.fill(headerWords)(0.U(dataWidth.W))))
+  val extractedSrcMac = RegInit(0.U(ETH_MAC_BITS.W))
+
+  io.in.ready := false.B
+  io.out.valid := false.B
+  io.out.bits := DontCare
+  io.srcMacAddr := extractedSrcMac
+
+
+  switch(state) {
+    is(s_idle) {
+      io.in.ready := true.B
+      when(io.in.fire) {
+        storedHeaderWords(0) := io.in.bits.data
+        when(headerWords.U === 1.U) {
+          // Single-word header: extract MAC immediately
+          val headerVec = VecInit(Seq(io.in.bits.data.asUInt))
+          val ethHeader = EthernetHeader(headerVec, dataWidth)
+          // Only update extracted MAC if it's valid (not zero, not broadcast)
+          when(ethHeader.srcmac =/= 0.U && ethHeader.srcmac =/= IceNetConsts.ETH_BCAST_MAC) {
+            extractedSrcMac := ethHeader.srcmac
+            dprintf(p"[EthernetHeaderExtractor] Extracted source MAC: 0x${Hexadecimal(ethHeader.srcmac)} (dst=0x${Hexadecimal(ethHeader.dstmac)}, type=0x${Hexadecimal(ethHeader.ethType)})\n")
+          }.otherwise {
+            dprintf(p"[EthernetHeaderExtractor] Ignoring invalid source MAC: 0x${Hexadecimal(ethHeader.srcmac)} (zero or broadcast)\n")
+          }
+          state := s_data
+        }.otherwise {
+          // Multi-word header: need to collect more words
+          wordIdx := 1.U
+          state := s_header
+        }
+      }
+    }
+    is(s_header) {
+      io.in.ready := true.B
+      when(io.in.fire) {
+        // Store the current word at its position
+        storedHeaderWords(wordIdx) := io.in.bits.data
+        val nextIdx = wordIdx + 1.U
+        when(nextIdx === headerWords.U) {
+          // All header words received, extract MAC
+          val headerVec = storedHeaderWords.map(_.asUInt)
+          val ethHeader = EthernetHeader(headerVec, dataWidth)
+          // Only update extracted MAC if it's valid (not zero, not broadcast)
+          // This prevents storing garbage from uninitialized state or corrupted packets
+          when(ethHeader.srcmac =/= 0.U && ethHeader.srcmac =/= IceNetConsts.ETH_BCAST_MAC) {
+            extractedSrcMac := ethHeader.srcmac
+            dprintf(p"[EthernetHeaderExtractor] Extracted source MAC: 0x${Hexadecimal(ethHeader.srcmac)} (dst=0x${Hexadecimal(ethHeader.dstmac)}, type=0x${Hexadecimal(ethHeader.ethType)})\n")
+          }.otherwise {
+            dprintf(p"[EthernetHeaderExtractor] Ignoring invalid source MAC: 0x${Hexadecimal(ethHeader.srcmac)} (zero or broadcast)\n")
+          }
+          wordIdx := 0.U
+          state := s_data
+        }.otherwise {
+          wordIdx := nextIdx
+        }
+      }
+    }
+    is(s_data) {
+      io.in.ready := io.out.ready
+      io.out.valid := io.in.valid
+      io.out.bits := io.in.bits
+
+      when(io.in.fire && io.in.bits.last) {
+        state := s_idle
+        wordIdx := 0.U
+      }
+    }
+  }
+}
+
+/**
+ * Ethernet Header Prepender Module
+ * Prepends Ethernet headers to packets with the specified source and destination MAC addresses.
+ * This module ensures packets are routed to the correct destination instead of using broadcast.
+ */
+class EthernetHeaderPrepender(dataWidth: Int, dbgEnabled: Boolean = false) extends Module {
+  val io = IO(new Bundle {
+    val in = Flipped(Decoupled(new StreamChannel(dataWidth)))
+    val out = Decoupled(new StreamChannel(dataWidth))
+    val srcMacAddr = Input(UInt(ETH_MAC_BITS.W))
+    val dstMacAddr = Input(UInt(ETH_MAC_BITS.W))
+  })
+  
+  // Debug prints controlled by parent connector
+  @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+  
+  val ETH_HEAD_WORDS = ETH_HEAD_BYTES * 8 / dataWidth  // Number of words for Ethernet header
+  val s_idle :: s_header :: s_data :: Nil = Enum(3)
+  val state = RegInit(s_idle)
+  val headerWordIdx = RegInit(0.U(log2Ceil(ETH_HEAD_WORDS + 1).W))
+  
+  // Capture destination MAC when packet starts (to ensure it's stable for entire packet)
+  val capturedDstMac = Reg(UInt(ETH_MAC_BITS.W))
+  val capturedSrcMac = Reg(UInt(ETH_MAC_BITS.W))
+  
+  // Ethernet header construction
+  // Format: [padding(2B) | dstmac(6B) | srcmac(6B) | ethType(2B)]
+  // For 64-bit words: word0 = [padding(2B) | dstmac[5:0](6B)], word1 = [srcmac(6B) | ethType(2B)]
+  val ethHeader = Wire(new EthernetHeader)
+  ethHeader.dstmac := capturedDstMac
+  ethHeader.srcmac := capturedSrcMac
+  ethHeader.ethType := 0x0800.U(ETH_TYPE_BITS.W)  // IPv4
+  ethHeader.padding := 0.U(ETH_PAD_BITS.W)
+  
+  val headerWords = ethHeader.toWords(dataWidth)
+  
+  io.in.ready := false.B
+  io.out.valid := false.B
+  io.out.bits := DontCare
+  
+  switch(state) {
+    is(s_idle) {
+      // Wait for packet start, capture MAC addresses, then send header
+      when(io.in.valid) {
+        capturedDstMac := io.dstMacAddr
+        capturedSrcMac := io.srcMacAddr
+        dprintf(p"[EthernetHeaderPrepender] Prepending header: src=0x${Hexadecimal(io.srcMacAddr)}, dst=0x${Hexadecimal(io.dstMacAddr)}\n")
+        state := s_header
+        headerWordIdx := 0.U
+      }
+    }
+    is(s_header) {
+      // Send Ethernet header words
+      io.out.valid := true.B
+      io.out.bits.data := headerWords(headerWordIdx)
+      io.out.bits.keep := NET_FULL_KEEP
+      io.out.bits.last := false.B
+      
+      when(io.out.ready) {
+        headerWordIdx := headerWordIdx + 1.U
+        when(headerWordIdx === (ETH_HEAD_WORDS - 1).U) {
+          state := s_data
+        }
+      }
+    }
+    is(s_data) {
+      // Forward packet data
+      io.in.ready := io.out.ready
+      io.out.valid := io.in.valid
+      io.out.bits := io.in.bits
+      
+      when(io.in.fire && io.in.bits.last) {
+        state := s_idle
+      }
+    }
+  }
 }
 
 /**
@@ -1074,16 +1251,20 @@ object RecursiveDoublingWithDMAConnector {
     // Data Path Connection and Buffering
     // ========================================================================================
 
-    // Input path: NIC -> Input Queue -> Accelerator
-    // Create a large input queue to buffer packets from the NIC before they reach the accelerator
-    // This prevents packet loss when the accelerator is busy processing previous packets
-    // Queue size of 256 entries can handle multiple large packets (130 words each)
-    val inQueue = Module(new Queue(chiselTypeOf(netio.out.bits), 256))
-    inQueue.io.enq <> netio.out
-    wrapperModule.io.net_in <> inQueue.io.deq
-    println("[RecursiveDoublingWithDMAConnector] Connected netio.out -> inQueue (256 entries) -> wrapper.io.net_in")
+    // Input path: NIC -> Ethernet Header Extractor -> Input Queue -> Accelerator
+    // Extract Ethernet headers to obtain source MAC (Level 0 origin) and remove headers before accelerator
+    val headerExtractor = Module(new EthernetHeaderExtractor(NET_IF_WIDTH, dbgEnabled))
+    headerExtractor.io.in <> netio.out
 
-    // Output path: Accelerator -> Output Queue -> NIC
+    val inQueue = Module(new Queue(chiselTypeOf(headerExtractor.io.out.bits), 256))
+    inQueue.io.enq <> headerExtractor.io.out
+    wrapperModule.io.net_in <> inQueue.io.deq
+    wrapperModule.io.level0SrcMac := headerExtractor.io.srcMacAddr
+
+    println("[RecursiveDoublingWithDMAConnector] Connected netio.out -> headerExtractor -> inQueue (256 entries) -> wrapper.io.net_in")
+    println("[RecursiveDoublingWithDMAConnector] Ethernet header extractor feeding Level 0 source MAC to accelerator")
+
+    // Output path: Accelerator -> Output Queue -> Ethernet Header Prepender -> NIC
     // Create a large output queue to buffer processed packets from the accelerator
     // This allows the accelerator to continue processing while the NIC handles transmission
     // Queue size of 256 entries can handle multiple large packets (16 packets * 130 words = 2080 words)
@@ -1091,10 +1272,17 @@ object RecursiveDoublingWithDMAConnector {
     outQueue.io.enq <> wrapperModule.io.net_out
     println("[RecursiveDoublingWithDMAConnector] Added output queue (256 entries) after module")
 
-    // Connect the output queue directly to the NIC input
-    // This creates the final link in the data path: accelerator -> queue -> NIC
-    netio.in <> outQueue.io.deq
-    println("[RecursiveDoublingWithDMAConnector] Connected wrapper.io.net_out -> outQueue -> netio.in")
+    // Ethernet header prepender: Adds Ethernet headers with correct destination MAC
+    // This ensures packets are routed to the correct destination instead of broadcast
+    val headerPrepender = Module(new EthernetHeaderPrepender(NET_IF_WIDTH, dbgEnabled))
+    headerPrepender.io.srcMacAddr := netio.macAddr
+    headerPrepender.io.dstMacAddr := wrapperModule.io.dstMacAddr
+    headerPrepender.io.in <> outQueue.io.deq
+    
+    // Connect the header prepender to the NIC input
+    // This creates the final link in the data path: accelerator -> queue -> header prepender -> NIC
+    netio.in <> headerPrepender.io.out
+    println("[RecursiveDoublingWithDMAConnector] Connected wrapper.io.net_out -> outQueue -> headerPrepender -> netio.in")
     
     // ========================================================================================
     // NIC Input Backpressure Monitoring
@@ -1219,7 +1407,21 @@ object RecursiveDoublingWithDMAConnector {
     
     // Configure NIC with standard PlusArg connections for simulation
     // These parameters can be overridden at runtime via command-line arguments
-    netio.macAddr := PlusArg("macaddr", width = 48)
+    // Default MAC address based on node rank: 00:12:6D:00:00:XX where XX is node rank
+    val nodeRank = PlusArg("node_rank", default = 0, docstring = "Node rank (0-7 for 8 nodes)", width = 8)
+    val baseMac = (0x00126D000000L).U(48.W)
+    val defaultMacAddr = baseMac | nodeRank(7, 0).asUInt
+    val macAddrValue = Mux(PlusArg("macaddr", width = 48).orR, 
+                          PlusArg("macaddr", width = 48),
+                          defaultMacAddr)
+    netio.macAddr := macAddrValue
+    
+    // Extract node rank from MAC address (last byte) and pass to module via PlusArg
+    // MAC format: 00:12:6D:00:00:XX where XX is typically the node rank
+    // This allows the module to calculate partner nodes for recursive doubling
+    // Note: PlusArg for node_rank can override this if MAC doesn't follow pattern
+    val nodeRankFromMac = macAddrValue(7, 0)  // Extract last byte as rank
+    // The module will use PlusArg("node_rank") which can be set explicitly or defaults to 0
     netio.rlimit.inc := PlusArg("rlimit-inc", 1, width = 32)
     netio.rlimit.period := PlusArg("rlimit-period", 1, width = 32)
     netio.rlimit.size := PlusArg("rlimit-size", 8, width = 32)
