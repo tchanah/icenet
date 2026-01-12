@@ -12,7 +12,7 @@ import freechips.rocketchip.util._
 import IceNetConsts._
 import freechips.rocketchip.tilelink.TLRAM
 import freechips.rocketchip.tilelink.TLXbar
-import midas.targetutils.SynthesizePrintf
+// import midas.targetutils.SynthesizePrintf
 
 // Custom imports for collective
 import icenet.collective._
@@ -972,8 +972,8 @@ object SimpleDmaControllerConnector {
 class RecursiveDoublingWithDMAWrapper(implicit p: Parameters) extends LazyModule {
   // Debug configuration: Enable/disable debug prints at elaboration time
   // This has no hardware cost when disabled - the printf statements are optimized away
-  private val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
-  @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+  // private val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
+  // @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
   
   // Dedicated RAM subsystem for DMA operations
   // This RAM is used by the RecursiveDoublingWithDMA accelerator to store:
@@ -1090,7 +1090,7 @@ class EthernetHeaderExtractor(dataWidth: Int, dbgEnabled: Boolean = false) exten
   })
 
   // Debug prints controlled by parent connector
-  @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+  // @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
 
   val headerWords       = ETH_HEAD_BYTES * 8 / dataWidth
   require(headerWords >= 1, "Ethernet header must span at least one word on the stream interface.")
@@ -1143,17 +1143,19 @@ class EthernetHeaderExtractor(dataWidth: Int, dbgEnabled: Boolean = false) exten
           
           when(srcMacHostOrder =/= 0.U && srcMacHostOrder =/= IceNetConsts.ETH_BCAST_MAC) {
             extractedSrcMac := srcMacHostOrder
-            dprintf(p"[EthernetHeaderExtractor] Extracted source MAC: 0x${Hexadecimal(srcMacHostOrder)} (wire=0x${Hexadecimal(ethHeader.srcmac)})\n")
-          }.otherwise {
-            dprintf(p"[EthernetHeaderExtractor] Ignoring invalid source MAC: 0x${Hexadecimal(srcMacHostOrder)} (zero or broadcast)\n")
           }
+          //   dprintf(p"[EthernetHeaderExtractor] Extracted source MAC: 0x${Hexadecimal(srcMacHostOrder)} (wire=0x${Hexadecimal(ethHeader.srcmac)})\n")
+          // }.otherwise {
+          //   dprintf(p"[EthernetHeaderExtractor] Ignoring invalid source MAC: 0x${Hexadecimal(srcMacHostOrder)} (zero or broadcast)\n")
+          // }
 
           when(dstMacHostOrder =/= 0.U && dstMacHostOrder =/= IceNetConsts.ETH_BCAST_MAC) {
             extractedDstMac := dstMacHostOrder
-            dprintf(p"[EthernetHeaderExtractor] Learned Identity: My MAC is 0x${Hexadecimal(dstMacHostOrder)} (wire=0x${Hexadecimal(ethHeader.dstmac)})\n")
-          }.otherwise {
-            dprintf(p"[EthernetHeaderExtractor] Ignoring invalid destination MAC: 0x${Hexadecimal(dstMacHostOrder)}\n")
           }
+          //   dprintf(p"[EthernetHeaderExtractor] Learned Identity: My MAC is 0x${Hexadecimal(dstMacHostOrder)} (wire=0x${Hexadecimal(ethHeader.dstmac)})\n")
+          // }.otherwise {
+          //   dprintf(p"[EthernetHeaderExtractor] Ignoring invalid destination MAC: 0x${Hexadecimal(dstMacHostOrder)}\n")
+          // }
 
           wordIdx   := 0.U
           state     := s_data
@@ -1189,7 +1191,7 @@ class EthernetHeaderPrepender(dataWidth: Int, dbgEnabled: Boolean = false) exten
   })
   
   // Debug prints controlled by parent connector
-  @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+  // @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
   
   val ETH_HEAD_WORDS  = ETH_HEAD_BYTES * 8 / dataWidth  // Number of words for Ethernet header
   val s_idle :: s_header :: s_data :: Nil = Enum(3)
@@ -1223,7 +1225,7 @@ class EthernetHeaderPrepender(dataWidth: Int, dbgEnabled: Boolean = false) exten
       when(io.in.valid) {
         capturedDstMac  := io.dstMacAddr
         capturedSrcMac  := io.srcMacAddr
-        dprintf(p"[EthernetHeaderPrepender] Prepending header: src=0x${Hexadecimal(io.srcMacAddr)}, dst=0x${Hexadecimal(io.dstMacAddr)}\n")
+        // dprintf(p"[EthernetHeaderPrepender] Prepending header: src=0x${Hexadecimal(io.srcMacAddr)}, dst=0x${Hexadecimal(io.dstMacAddr)}\n")
         state           := s_header
         headerWordIdx   := 0.U
       }
@@ -1273,8 +1275,8 @@ object RecursiveDoublingWithDMAConnector {
    */
   def connect(netio: NICIO, switchio: NICIOvonly, nicConf: NICConfig, nodeRank: Int = 0, clock: Clock, reset: Bool)(implicit p: Parameters): Unit = {
     // Debug configuration
-    val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
-    @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+    // val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
+    // @inline def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
     
     println(s"[RecursiveDoublingWithDMAConnector] Attaching RecursiveDoublingWithDMA wrapper with Multi-Node Routing Support.")
 
@@ -1356,7 +1358,8 @@ object RecursiveDoublingWithDMAConnector {
     inputArbiter.io.in(1) <> networkQueue.io.deq    // Priority 1: Network
 
     // Feed Arbiter output to Extractor
-    val headerExtractor = Module(new EthernetHeaderExtractor(NET_IF_WIDTH, dbgEnabled))
+    // val headerExtractor = Module(new EthernetHeaderExtractor(NET_IF_WIDTH, dbgEnabled))
+    val headerExtractor = Module(new EthernetHeaderExtractor(NET_IF_WIDTH, false))
     headerExtractor.io.in <> inputArbiter.io.out
     
     // Constants
@@ -1398,13 +1401,13 @@ object RecursiveDoublingWithDMAConnector {
     netio.macAddr       := testerMac
     
     // Print when derivedNodeRank changes (triggered by Setup packet)
-    val prevRank = RegNext(derivedNodeRank)
-    when(derivedNodeRank =/= prevRank) {
-        SynthesizePrintf { 
-            printf("[NICConn] Node rank updated: %d -> %d, testerMac=0x%x, accelMac=0x%x\n", 
-                   prevRank, derivedNodeRank, testerMac, accelMac) 
-        }
-    }
+    // val prevRank = RegNext(derivedNodeRank)
+    // when(derivedNodeRank =/= prevRank) {
+    //     SynthesizePrintf { 
+    //         printf("[NICConn] Node rank updated: %d -> %d, testerMac=0x%x, accelMac=0x%x\n", 
+    //                prevRank, derivedNodeRank, testerMac, accelMac) 
+    //     }
+    // }
     // Set Connector/SimNetwork identity to Accel MAC
     switchio.macAddr    := accelMac
 
@@ -1419,10 +1422,10 @@ object RecursiveDoublingWithDMAConnector {
     wrapperModule.io.level0SrcMac := headerExtractor.io.srcMacAddr
 
     // Antigravity Verification: Ingress Packet Trace
-    when(headerExtractor.io.out.valid && headerExtractor.io.out.ready && headerExtractor.io.out.bits.last) {
-        // SynthesizePrintf { printf("[NICConn] IN: src=0x%x dst=0x%x --- CPU Drop: %d, Network Drop: %d\n", headerExtractor.io.srcMacAddr, headerExtractor.io.dstMacAddr, cpuQueueDropCount, networkQueueDropCount) }
-        SynthesizePrintf { printf("[NICConn] IN: src=0x%x dst=0x%x\n", headerExtractor.io.srcMacAddr, headerExtractor.io.dstMacAddr) }
-    }
+    // when(headerExtractor.io.out.valid && headerExtractor.io.out.ready && headerExtractor.io.out.bits.last) {
+    //     // SynthesizePrintf { printf("[NICConn] IN: src=0x%x dst=0x%x --- CPU Drop: %d, Network Drop: %d\n", headerExtractor.io.srcMacAddr, headerExtractor.io.dstMacAddr, cpuQueueDropCount, networkQueueDropCount) }
+    //     SynthesizePrintf { printf("[NICConn] IN: src=0x%x dst=0x%x\n", headerExtractor.io.srcMacAddr, headerExtractor.io.dstMacAddr) }
+    // }
 
     // ========================================================================================
     // 4. Output Path: Module -> Queue -> Prepender -> Router -> (NIC RX or Switch TX)
@@ -1441,7 +1444,8 @@ object RecursiveDoublingWithDMAConnector {
     outQueue.io.enq.bits.dstMac     := wrapperModule.io.dstMacAddr // Sampled at enq time (correct)
     wrapperModule.io.net_out.ready  := outQueue.io.enq.ready
 
-    val headerPrepender = Module(new EthernetHeaderPrepender(NET_IF_WIDTH, dbgEnabled))
+    // val headerPrepender = Module(new EthernetHeaderPrepender(NET_IF_WIDTH, dbgEnabled))
+    val headerPrepender = Module(new EthernetHeaderPrepender(NET_IF_WIDTH, false))
     headerPrepender.io.srcMacAddr   := headerExtractor.io.dstMacAddr // My MAC (as learned from incoming)
     headerPrepender.io.dstMacAddr   := outQueue.io.deq.bits.dstMac   // Use the queued MAC
     headerPrepender.io.in.valid     := outQueue.io.deq.valid
@@ -1459,13 +1463,13 @@ object RecursiveDoublingWithDMAConnector {
     val isForHost         = packetDestMac === testerMac
 
     // Debugging Route
-    when(headerPrepender.io.out.valid && headerPrepender.io.out.ready && headerPrepender.io.out.bits.last) {
-         when(isForHost) {
-             SynthesizePrintf { printf("[NICConn] OUT: To HOST (dst=0x%x)\n", packetDestMac) }
-         }.otherwise {
-             SynthesizePrintf { printf("[NICConn] OUT: To SWITCH (dst=0x%x)\n", packetDestMac) }
-         }
-    }
+    // when(headerPrepender.io.out.valid && headerPrepender.io.out.ready && headerPrepender.io.out.bits.last) {
+    //      when(isForHost) {
+    //          SynthesizePrintf { printf("[NICConn] OUT: To HOST (dst=0x%x)\n", packetDestMac) }
+    //      }.otherwise {
+    //          SynthesizePrintf { printf("[NICConn] OUT: To SWITCH (dst=0x%x)\n", packetDestMac) }
+    //      }
+    // }
 
     // Splitter Logic
     // netio.in (NIC RX) gets packet if isForHost

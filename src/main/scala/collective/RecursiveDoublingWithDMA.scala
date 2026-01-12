@@ -8,7 +8,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import icenet.{NICKey, NICIOvonly, IceNetConsts, StreamChannel, StreamIO}
 import hardfloat._
-import midas.targetutils.SynthesizePrintf
+// import midas.targetutils.SynthesizePrintf
 
 // === Parameters ===
 
@@ -75,8 +75,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         val nodeRank = Output(UInt(8.W)) // Output driven by internal register
     })
     // Elabor-time debug helper (no hardware cost when disabled)
-    private val dbgEnabled: Boolean = outer.params.EnableDebug
-    @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
+    // private val dbgEnabled: Boolean = outer.params.EnableDebug
+    // @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
     
     // Get the TileLink client interface
     val (tl, edge)              = outer.node.out(0)
@@ -273,19 +273,16 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
     
     // --- Metadata Assembly ---
-    // Include sender rank in reserved byte for partner verification
-    // Also include destination MAC lowest byte for debugging routing
-    // Note: We'll calculate the destination MAC in the state machine where values are guaranteed to be correct
-    // Register to hold the destination MAC lowest byte for metadata
-    val dstMacLowestByteReg = RegInit(0.U(8.W))
+    // Bytes 4-5 are reserved for future use (currently 0)
+    // Note: For Setup packets (opCode=0xFE), the rank is read from byte 5 of the incoming packet,
+    // but we don't echo it back. The hardware handles Setup packets separately.
     
     val outgoingMetadataWord = Wire(UInt(outer.params.dataWidth.W))
-    // Metadata with destination MAC from register (set in state machine)
     outgoingMetadataWord := Cat(
         nextLevel(7,0),
         maxLevelReg(7,0),
-        myRank(7,0),        // Sender rank in reserved byte (for partner verification)
-        dstMacLowestByteReg,   // Destination MAC lowest byte (set in state machine before sending)
+        0.U(8.W),           // Reserved byte 5 (was sender rank debug field)
+        0.U(8.W),           // Reserved byte 4 (was dst MAC low debug field)
         operationReg,
         collectiveTypeReg,
         collectiveIdReg(15, 8),
@@ -300,19 +297,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         isReadingInputData      := false.B
         
         when(incoming_fire) {
-            dprintf(p"[s_idle] Received metadata: level=${incoming_bits.data(63, 56)}, maxLevel=${incoming_bits.data(55, 48)}, collId=0x${Hexadecimal(incoming_bits.data(15, 0))}\n")
             val metaWord            = incoming_bits.data
             // Define variables reused later
             val newCollectiveId     = metaWord(15, 0)
-            val senderRank          = metaWord(47, 40)
             val receivedLevel       = metaWord(63, 56)
             val opCode              = metaWord(31, 24)
-            
-            // DEBUG: Print raw packet info for every incoming packet
-            SynthesizePrintf {
-                printf("[s_idle] RECV: opCode=0x%x, level=%d, collId=0x%x, senderRank=%d, myRank=%d\n",
-                       opCode, receivedLevel, newCollectiveId, senderRank, myRankReg)
-            }
             
             // Check for Setup Packet (OP_SETUP = 0xFE)
             // COMBINED SETUP+WARMUP: If collID=0xFFFF, send acknowledgment response
@@ -324,9 +313,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 level0SourceMac         := io.level0SrcMac
                 level0SourceMacValid    := true.B
                 
-                SynthesizePrintf {
-                    printf("[s_idle] SETUP PACKET RECEIVED: oldRank=%d, newRank=%d, collId=0x%x\n", myRankReg, newRank, newCollectiveId)
-                }
+                // SynthesizePrintf {
+                //     printf("[s_idle] SETUP PACKET RECEIVED: oldRank=%d, newRank=%d, collId=0x%x\n", myRankReg, newRank, newCollectiveId)
+                // }
                 
                 // If collID is 0xFFFF, this is a combined Setup+Warmup - need to send ACK after draining packet
                 when(newCollectiveId === 0xFFFF.U) {
@@ -341,7 +330,6 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     
                     // Destination is the sender of the Setup packet
                     outgoingDstMac          := io.level0SrcMac
-                    dstMacLowestByteReg     := io.level0SrcMac(7, 0)
                     
                     // Zero out data buffer for consistent full-sized ACK packet
                     for (i <- 0 until NUM_DATA_ELEMENTS) {
@@ -349,10 +337,10 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     }
                     sentDataWordCount       := 0.U
                     
-                    SynthesizePrintf {
-                        printf("[s_idle] SETUP+WARMUP: Will send ACK after draining packet. Dst=0x%x, rank=%d\n", 
-                               io.level0SrcMac, newRank)
-                    }
+                    // SynthesizePrintf {
+                    //     printf("[s_idle] SETUP+WARMUP: Will send ACK after draining packet. Dst=0x%x, rank=%d\n", 
+                    //            io.level0SrcMac, newRank)
+                    // }
                     
                     // Set flag to send ACK after draining full packet
                     pendingSetupAck         := true.B
@@ -372,27 +360,14 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     level0SourceMacValid    := true.B
                     
                     // Debug print to confirm what we latched
-                    dprintf(p"[s_idle] Level 0 Packet: Latched Source MAC for Final Result: 0x${Hexadecimal(io.level0SrcMac)}\n")
+                    // dprintf(p"[s_idle] Level 0 Packet: Latched Source MAC for Final Result: 0x${Hexadecimal(io.level0SrcMac)}\n")
                 }
             
-                // Verify packet source based on level
-                // Level 0: From PyTorch/external (no partner verification needed)
-                // Level 1-4: From partner node (verify sender matches expected partner)
-                when(receivedLevel > 0.U) {
-                    // For levels 1-4, calculate expected partner from previous level
-                    // If we're at level L, we expect packet from the partner we sent to at level L-1
-                    val expectedPartnerRank = calculatePartnerRank(receivedLevel - 1.U, myRank)
-                    when(senderRank === expectedPartnerRank) {
-                        dprintf(p"[s_idle] Packet from expected partner rank=${senderRank} at level=${receivedLevel}\n")
-                    }.otherwise {
-                        dprintf(p"[s_idle] WARNING: Packet from unexpected sender. Level=${receivedLevel}, expected rank=${expectedPartnerRank}, got ${senderRank}\n")
-                        // Still process - might be from different collective or out-of-order
-                    }
-                }
+
                 
                 // Clear memory valid flags if this is a new test set (different collective ID)
                 when(newCollectiveId =/= collectiveIdReg) {
-                    dprintf(p"[s_idle] New test set detected (collective ID changed from 0x${Hexadecimal(collectiveIdReg)} to 0x${Hexadecimal(newCollectiveId)}), clearing all valid flags\n")
+                    // dprintf(p"[s_idle] New test set detected (collective ID changed from 0x${Hexadecimal(collectiveIdReg)} to 0x${Hexadecimal(newCollectiveId)}), clearing all valid flags\n")
 
                     totalChunksForCollective := 0.U
                     
@@ -403,7 +378,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     }
                     // Mark all memory blocks as free for the new collective
                     memFreeBitmap := (~0.U(NUM_MEM_BLOCKS.W))
-                    dprintf(p"[s_idle] Resetting memory manager: all ${NUM_MEM_BLOCKS} blocks are now free.\n")
+                    // dprintf(p"[s_idle] Resetting memory manager: all ${NUM_MEM_BLOCKS} blocks are now free.\n")
 
                     numFreeBlocks           := NUM_MEM_BLOCKS.U
                     allocSearchPtr          := 0.U
@@ -428,7 +403,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             
         // PRIORITY 2: No incoming packet, but the background search found a chunk.
         } .elsewhen(foundChunkValid) {
-            dprintf(p"[s_idle] Consuming chunk C${foundChunkIndex} at L${foundChunkLevel} found by background search.\n")
+            // dprintf(p"[s_idle] Consuming chunk C${foundChunkIndex} at L${foundChunkLevel} found by background search.\n")
 
             // Consume the found chunk
             processingLevel         := foundChunkLevel
@@ -438,10 +413,10 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             blockIndexInFlightReg   := extractedBlock
             
             // SYNTH DEBUG: Track chunk processing start
-            SynthesizePrintf {
-                printf("[s_idle] Chunk Found: L%d C%d blk=%d (background)\n",
-                       foundChunkLevel, foundChunkIndex, extractedBlock)
-            }
+            // SynthesizePrintf {
+            //     printf("[s_idle] Chunk Found: L%d C%d blk=%d (background)\n",
+            //            foundChunkLevel, foundChunkIndex, extractedBlock)
+            // }
             
             // Invalidate the found chunk to re-enable the background search.
             foundChunkValid         := false.B
@@ -462,12 +437,12 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             chunkIndexReg   := metaWord2(31, 0)
             totalChunksReg  := metaWord2(63, 32)
 
-            dprintf(p"[s_recv_meta2] Received metaWord2: currentChunks = 0x${Hexadecimal(metaWord2(31, 0))} totalChunks = 0x${Hexadecimal(metaWord2(63, 32))}\n")
+            // dprintf(p"[s_recv_meta2] Received metaWord2: currentChunks = 0x${Hexadecimal(metaWord2(31, 0))} totalChunks = 0x${Hexadecimal(metaWord2(63, 32))}\n")
             
             // Update total chunks for collective if this is the first chunk or if it's larger
             when(totalChunksForCollective === 0.U || totalChunksReg > totalChunksForCollective) {
                 totalChunksForCollective := metaWord2(63, 32)
-                dprintf(p"[s_recv_meta2] Updated totalChunksForCollective to ${metaWord2(63, 32)}\n")
+                // dprintf(p"[s_recv_meta2] Updated totalChunksForCollective to ${metaWord2(63, 32)}\n")
             }
 
             // Start data word count at 0 since we just finished receiving the metadata word
@@ -494,11 +469,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             }
 
             // Only print for the first and last data word of the packet.
-            when(receivedDataWordCount === 0.U || receivedDataWordCount === (NUM_DATA_WORDS.U - 1.U)) {
-                val e0  = incoming_bits.data(ELEMENT_WIDTH-1, 0)
-                val e1  = incoming_bits.data(2*ELEMENT_WIDTH-1, ELEMENT_WIDTH)
-                dprintf(p"[s_recv_data] Recv word ${receivedDataWordCount}: elements[${baseElementIndex}]=0x${Hexadecimal(e0)}, elements[${baseElementIndex+1.U}]=0x${Hexadecimal(e1)}\n")
-            }
+            // when(receivedDataWordCount === 0.U || receivedDataWordCount === (NUM_DATA_WORDS.U - 1.U)) {
+            //     val e0  = incoming_bits.data(ELEMENT_WIDTH-1, 0)
+            //     val e1  = incoming_bits.data(2*ELEMENT_WIDTH-1, ELEMENT_WIDTH)
+            //     dprintf(p"[s_recv_data] Recv word ${receivedDataWordCount}: elements[${baseElementIndex}]=0x${Hexadecimal(e0)}, elements[${baseElementIndex+1.U}]=0x${Hexadecimal(e1)}\n")
+            // }
             
             // DEBUG: Track elements 242-255 (words 121-127) - the tail end where 244 fails
             // when(receivedDataWordCount >= 121.U && receivedDataWordCount <= 127.U) {
@@ -530,13 +505,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
                     // Check if allocator is ready
                     when(foundBlockValid) { // Allocator has a block ready NOW
-                        dprintf(p"[s_recv_data] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
+                        // dprintf(p"[s_recv_data] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
                         blockIndexToWriteReg    := foundBlockIndex
                         foundBlockValid         := false.B
                         allocSearchPtr          := foundBlockIndex + 1.U
                         state                   := s_dma_write // Go directly to write
                     } .otherwise { // Allocator not ready, need to wait
-                        dprintf(p"[s_recv_data] Allocator not ready. Transitioning to s_wait_alloc.\n")
+                        // dprintf(p"[s_recv_data] Allocator not ready. Transitioning to s_wait_alloc.\n")
                         state                   := s_wait_alloc // Go to waiting state
                     }
                     // Reset counters regardless of next state
@@ -544,16 +519,16 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     receivedDataWordCount   := 0.U
 
                     // Conditional debug print
-                    when(currentLevelReg === 0.U) {
-                        dprintf(p"[s_recv_data] Level 0 optimization: data already in processedDataBuffer, ready to send\n")
-                    }.otherwise {
-                        dprintf(p"[s_recv_data] Store first: storing chunk ${chunkIndexReg} for level ${currentLevelReg} to memory\n")
-                    }
+                    // when(currentLevelReg === 0.U) {
+                    //     dprintf(p"[s_recv_data] Level 0 optimization: data already in processedDataBuffer, ready to send\n")
+                    // }.otherwise {
+                    //     dprintf(p"[s_recv_data] Store first: storing chunk ${chunkIndexReg} for level ${currentLevelReg} to memory\n")
+                    // }
 
-                    SynthesizePrintf {
-                        printf("[s_recv_data] Received: myRank=%d, currentLevel=%d, chunk=%d, nextLevel=%d\n",
-                            myRank, currentLevelReg, chunkIndexReg, nextLevel)
-                    }
+                    // SynthesizePrintf {
+                    //     printf("[s_recv_data] Received: myRank=%d, currentLevel=%d, chunk=%d, nextLevel=%d\n",
+                    //         myRank, currentLevelReg, chunkIndexReg, nextLevel)
+                    // }
                 }
             }
         }
@@ -593,7 +568,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                         memFreeBitmap   := memFreeBitmap & (~mask)
                     }
                     numFreeBlocks                       := numFreeBlocks - 1.U
-                    dprintf(p"[s_dma_write] Decremented free blocks to ${numFreeBlocks - 1.U}\n")
+                    // dprintf(p"[s_dma_write] Decremented free blocks to ${numFreeBlocks - 1.U}\n")
 
                     when(isStoringIncomingData) {
                         // Write incoming block index field into packed vector
@@ -604,7 +579,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                         val zext     = Cat(0.U((BLOCK_FIELDS_PER_LEVEL_WIDTH - BLOCK_INDEX_BITS).W), blockIndexToWriteReg.asUInt)
                         val insert   = (zext << shamt)
                         incomingBlockFields(currentLevelReg) := (cur & mask) | insert
-                        dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for INCOMING L${currentLevelReg}C${chunkIndexReg}\n")
+                        // dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for INCOMING L${currentLevelReg}C${chunkIndexReg}\n")
                     }.otherwise {
                         // Write processed block index field into packed vector
                         val cur      = processedBlockFields(currentLevelReg)
@@ -614,23 +589,23 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                         val zext     = Cat(0.U((BLOCK_FIELDS_PER_LEVEL_WIDTH - BLOCK_INDEX_BITS).W), blockIndexToWriteReg.asUInt)
                         val insert   = (zext << shamt)
                         processedBlockFields(currentLevelReg) := (cur & mask) | insert
-                        dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for PROCESSED L${currentLevelReg}C${chunkIndexReg}\n")
+                        // dprintf(p"[s_dma_write] Allocating block ${blockIndexToWriteReg} for PROCESSED L${currentLevelReg}C${chunkIndexReg}\n")
                     }
                 }
 
                 // Debug prints for first and last word, including elements
-                when(dmaWordCount === 0.U || dmaWordCount === (WORDS_PER_CHUNK.U - 1.U)) {
-                    when(isStoringIncomingData) {
-                        dprintf(p"[s_dma_write] Write request: incoming data, level=${currentLevelReg}, chunk=${chunkIndexReg}, word=${dmaWordCount}, addr=0x${Hexadecimal(tl.a.bits.address)}\n")
-                    }.otherwise {
-                        dprintf(p"[s_dma_write] Write request: processed data, level=${currentLevelReg}, chunk=${chunkIndexReg}, word=${dmaWordCount}, addr=0x${Hexadecimal(tl.a.bits.address)}\n")
-                    }
-                    val eIdx0 = baseElementIndex
-                    val eIdx1 = baseElementIndex + 1.U
-                    val e0    = Mux(eIdx0 < NUM_DATA_ELEMENTS.U, dataSource(eIdx0), 0.U)
-                    val e1    = Mux(eIdx1 < NUM_DATA_ELEMENTS.U, dataSource(eIdx1), 0.U)
-                    dprintf(p"[s_dma_write]   Elements: [${eIdx0}]=0x${Hexadecimal(e0)}, [${eIdx1}]=0x${Hexadecimal(e1)}\n")
-                }
+                // when(dmaWordCount === 0.U || dmaWordCount === (WORDS_PER_CHUNK.U - 1.U)) {
+                //     when(isStoringIncomingData) {
+                //         dprintf(p"[s_dma_write] Write request: incoming data, level=${currentLevelReg}, chunk=${chunkIndexReg}, word=${dmaWordCount}, addr=0x${Hexadecimal(tl.a.bits.address)}\n")
+                //     }.otherwise {
+                //         dprintf(p"[s_dma_write] Write request: processed data, level=${currentLevelReg}, chunk=${chunkIndexReg}, word=${dmaWordCount}, addr=0x${Hexadecimal(tl.a.bits.address)}\n")
+                //     }
+                //     val eIdx0 = baseElementIndex
+                //     val eIdx1 = baseElementIndex + 1.U
+                //     val e0    = Mux(eIdx0 < NUM_DATA_ELEMENTS.U, dataSource(eIdx0), 0.U)
+                //     val e1    = Mux(eIdx1 < NUM_DATA_ELEMENTS.U, dataSource(eIdx1), 0.U)
+                //     dprintf(p"[s_dma_write]   Elements: [${eIdx0}]=0x${Hexadecimal(e0)}, [${eIdx1}]=0x${Hexadecimal(e1)}\n")
+                // }
                 
                 // DEBUG: Track elements 242-255 (words 121-127) during DMA write
                 // when(dmaWordCount >= 121.U && dmaWordCount <= 127.U) {
@@ -666,7 +641,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                         val bitMask = (1.U(MAX_CHUNKS.W)) << bitIdx
                         chunkArrivedBitmap(currentLevelReg) := chunkArrivedBitmap(currentLevelReg) | bitMask
                     }
-                    dprintf(p"[s_wait_write] Incoming Level ${currentLevelReg} Chunk ${chunkIndexReg} stored\n")
+                    // dprintf(p"[s_wait_write] Incoming Level ${currentLevelReg} Chunk ${chunkIndexReg} stored\n")
 
                     // Just stored incoming data - now check if processing is possible
                     isStoringIncomingData   := false.B
@@ -674,7 +649,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     // Fast-track check: Is this incoming chunk now processable?
                     val incomingChunkProcessable = canProcessChunk(currentLevelReg, chunkIndexReg)
                     when(incomingChunkProcessable) {
-                        dprintf(p"[s_wait_write] FAST-TRACK: Incoming chunk L${currentLevelReg}C${chunkIndexReg} is immediately processable\n")
+                        // dprintf(p"[s_wait_write] FAST-TRACK: Incoming chunk L${currentLevelReg}C${chunkIndexReg} is immediately processable\n")
                         // Set up for immediate processing
                         processingChunkIndex    := chunkIndexReg
                         processingLevel         := currentLevelReg
@@ -688,18 +663,17 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                         state                   := s_idle
                     }
                 }.otherwise {
-                    dprintf(p"[s_wait_write] Processed Level ${currentLevelReg} Chunk ${chunkIndexReg} stored\n")
+                    // dprintf(p"[s_wait_write] Processed Level ${currentLevelReg} Chunk ${chunkIndexReg} stored\n")
                     
                     // Calculate destination MAC for intermediate level (send to partner)
                     val partnerRankForSend = calculatePartnerRank(currentLevelReg, myRank)
                     val partnerMacForSend = calculatePartnerMac(currentLevelReg, myRank)
                     outgoingDstMac := partnerMacForSend
-                    dstMacLowestByteReg := partnerMacForSend(7, 0)
                     
-                    SynthesizePrintf {
-                        printf("[RecursiveDoubling] Intermediate level: myRank=%d, currentLevel=%d, partnerRank=%d, dstMAC=0x%x\n",
-                            myRank, currentLevelReg, partnerRankForSend, partnerMacForSend)
-                    }
+                    // SynthesizePrintf {
+                    //     printf("[RecursiveDoubling] Intermediate level: myRank=%d, currentLevel=%d, partnerRank=%d, dstMAC=0x%x\n",
+                    //         myRank, currentLevelReg, partnerRankForSend, partnerMacForSend)
+                    // }
                     
                     state                   := s_send_meta
                 }
@@ -725,13 +699,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
 
             when(tl.a.fire) {
-                when(readReqCount === 0.U || readReqCount === (WORDS_PER_CHUNK.U - 1.U)) {
-                    when(isReadingInputData) {
-                        dprintf(p"[s_dma_read] Reading input data: level=${processingLevel}, chunk=${processingChunkIndex}, word=${readReqCount}, addr=0x${Hexadecimal(readAddr)}\n")
-                    }.otherwise {
-                        dprintf(p"[s_dma_read] Reading previous level data: level=${processingLevel - 1.U}, chunk=${processingChunkIndex}, word=${readReqCount}, addr=0x${Hexadecimal(readAddr)}\n")
-                    }
-                }
+                // when(readReqCount === 0.U || readReqCount === (WORDS_PER_CHUNK.U - 1.U)) {
+                //     when(isReadingInputData) {
+                //         dprintf(p"[s_dma_read] Reading input data: level=${processingLevel}, chunk=${processingChunkIndex}, word=${readReqCount}, addr=0x${Hexadecimal(readAddr)}\n")
+                //     }.otherwise {
+                //         dprintf(p"[s_dma_read] Reading previous level data: level=${processingLevel - 1.U}, chunk=${processingChunkIndex}, word=${readReqCount}, addr=0x${Hexadecimal(readAddr)}\n")
+                //     }
+                // }
                 
                 state                   := s_wait_read
             }
@@ -745,9 +719,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             val dataWord    = tl.d.bits.data
 
             // Only print for the first and last word of the DMA transfer.
-            when(readWordCount === 0.U || readWordCount === (WORDS_PER_CHUNK.U - 1.U)) {
-                dprintf(p"[s_wait_read] DMA Read Response word ${readWordCount}: data=0x${Hexadecimal(dataWord)}\n")
-            }
+            // when(readWordCount === 0.U || readWordCount === (WORDS_PER_CHUNK.U - 1.U)) {
+            //     dprintf(p"[s_wait_read] DMA Read Response word ${readWordCount}: data=0x${Hexadecimal(dataWord)}\n")
+            // }
 
             val wordIndex = readWordCount
             // Unpack into appropriate buffer based on what we're reading
@@ -797,13 +771,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     memFreeBitmap := memFreeBitmap | mask
                 }
                 numFreeBlocks                       := numFreeBlocks + 1.U
-                dprintf(p"[s_wait_read] Read complete. Freed block ${blockIndexInFlightReg}. Free blocks: ${numFreeBlocks + 1.U}\n")
+                // dprintf(p"[s_wait_read] Read complete. Freed block ${blockIndexInFlightReg}. Free blocks: ${numFreeBlocks + 1.U}\n")
 
                 // Now, determine next action
                 when(isReadingInputData) {
                     // Phase 1 complete, start Phase 2: read previous level data
                     // Note: Level 0 never reaches read states with our optimization
-                    dprintf(p"[s_wait_read] Input data read complete, starting previous level read\n")
+                    // dprintf(p"[s_wait_read] Input data read complete, starting previous level read\n")
 
                     // Calculate and store the NEXT block index for the second read phase
                     blockIndexInFlightReg   := (processedBlockFields(processingLevel - 1.U) >> (processingChunkIndex * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
@@ -813,7 +787,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     readReqCount        := 0.U
                     state               := s_dma_read
                 }.otherwise {
-                    dprintf(p"[s_wait_read] Previous level data read complete, ready for FPU\n")
+                    // dprintf(p"[s_wait_read] Previous level data read complete, ready for FPU\n")
                     // Both reads complete, proceed to FPU processing
                     state               := s_wait_read_done
                 }
@@ -824,15 +798,15 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     .elsewhen(state === s_wait_read_done) {
         // Both input data and previous level data are now in buffers, ready for FPU
         // Note: Level 0 never reaches this state with our optimization
-        dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition pipeline for level ${processingLevel}, chunk ${processingChunkIndex}\n")
-        dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, memoryReadBuffer[0]=0x${Hexadecimal(memoryReadBuffer(0))}\n")
+        // dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition pipeline for level ${processingLevel}, chunk ${processingChunkIndex}\n")
+        // dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, memoryReadBuffer[0]=0x${Hexadecimal(memoryReadBuffer(0))}\n")
 
-            // Both input data and previous level data are now in buffers, ready for FPU
-        dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition for L${processingLevel}C${processingChunkIndex}\n")
+        //     // Both input data and previous level data are now in buffers, ready for FPU
+        // dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition for L${processingLevel}C${processingChunkIndex}\n")
 
-        // DEBUG: Print the first few elements of the input buffers to verify correctness
-        dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, [1]=0x${Hexadecimal(incomingDataBuffer(1))}\n")
-        dprintf(p"[s_wait_read_done] memoryReadBuffer[0]  =0x${Hexadecimal(memoryReadBuffer(0))}, [1]=0x${Hexadecimal(memoryReadBuffer(1))}\n")
+        // // DEBUG: Print the first few elements of the input buffers to verify correctness
+        // dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, [1]=0x${Hexadecimal(incomingDataBuffer(1))}\n")
+        // dprintf(p"[s_wait_read_done] memoryReadBuffer[0]  =0x${Hexadecimal(memoryReadBuffer(0))}, [1]=0x${Hexadecimal(memoryReadBuffer(1))}\n")
 
 
         state           := s_fp_add_pipe
@@ -869,13 +843,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
         // TRANSITION: When the last element is processed, move to the next state.
         when(elementIdx === (NUM_DATA_ELEMENTS - 1).U) {
-            dprintf(p"[s_fp_add_pipe] All FP results collected.\n")
-            dprintf(p"[s_fp_add_pipe] processedDataBuffer[0]=0x${Hexadecimal(processedDataBuffer(0))}, [1]=0x${Hexadecimal(processedDataBuffer(1))}\n")
-            dprintf(p"[s_fp_add_pipe] Last FP sum: 0x${Hexadecimal(sum)}\n")
+            // dprintf(p"[s_fp_add_pipe] All FP results collected.\n")
+            // dprintf(p"[s_fp_add_pipe] processedDataBuffer[0]=0x${Hexadecimal(processedDataBuffer(0))}, [1]=0x${Hexadecimal(processedDataBuffer(1))}\n")
+            // dprintf(p"[s_fp_add_pipe] Last FP sum: 0x${Hexadecimal(sum)}\n")
             
             when(processingLevel < maxLevelReg) {
                 // Store processed data back to memory
-                dprintf(p"[s_fp_add_pipe] Chunk ${processingChunkIndex} FPU complete for L${processingLevel}. Checking allocator...\n")
+                // dprintf(p"[s_fp_add_pipe] Chunk ${processingChunkIndex} FPU complete for L${processingLevel}. Checking allocator...\n")
                 
                 // Set up info needed for DMA write *before* checking allocator
                 isStoringIncomingData   := false.B // This is always processed data
@@ -884,27 +858,26 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
                 // Check if allocator is ready
                 when(foundBlockValid) { // Allocator ready NOW
-                    dprintf(p"[s_fp_add_pipe] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
+                    // dprintf(p"[s_fp_add_pipe] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
                     blockIndexToWriteReg    := foundBlockIndex
                     foundBlockValid         := false.B
                     allocSearchPtr          := foundBlockIndex + 1.U
                     state                   := s_dma_write // Go directly to write
                 } .otherwise { // Allocator not ready, need to wait
-                    dprintf(p"[s_fp_add_pipe] Allocator not ready. Transitioning to s_wait_alloc.\n")
+                    // dprintf(p"[s_fp_add_pipe] Allocator not ready. Transitioning to s_wait_alloc.\n")
                     state                   := s_wait_alloc // Go to waiting state
                 }
                 // Reset counter regardless of next state
                 dmaWordCount            := 0.U
             }.otherwise {
                 // Final level - send response directly without storing
-                dprintf(p"[s_fp_add_pipe] Final level chunk ${processingChunkIndex} complete, sending response directly\n")
+                // dprintf(p"[s_fp_add_pipe] Final level chunk ${processingChunkIndex} complete, sending response directly\n")
                 currentLevelReg         := processingLevel
                 chunkIndexReg           := processingChunkIndex
                 
                 // Calculate destination MAC for final level (send back to Level 0 source)
                 val dstMacForFinal = Mux(level0SourceMacValid, level0SourceMac, IceNetConsts.ETH_BCAST_MAC)
                 outgoingDstMac := dstMacForFinal
-                dstMacLowestByteReg := dstMacForFinal(7, 0)
                 
                 // SynthesizePrintf {
                 //     printf("[RecursiveDoubling] Final level: myRank=%d, dstMAC=0x%x\n", myRank, dstMacForFinal)
@@ -921,7 +894,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         io.out.valid := false.B // Ensure no output during wait
 
         when(foundBlockValid) {
-            dprintf(p"[s_wait_alloc] Allocator ready! Latching block ${foundBlockIndex} and proceeding to DMA write.\n")
+            // dprintf(p"[s_wait_alloc] Allocator ready! Latching block ${foundBlockIndex} and proceeding to DMA write.\n")
             // Consume the block info
             blockIndexToWriteReg    := foundBlockIndex
             foundBlockValid         := false.B
@@ -953,7 +926,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Invalidate background search if it was pointing to this chunk
             when(foundChunkValid && foundChunkLevel === currentLevelReg && foundChunkIndex === chunkIndexReg) {
                 foundChunkValid := false.B
-                dprintf(p"[s_send_meta] Invalidated background search result for L${currentLevelReg}C${chunkIndexReg}\n")
+                // dprintf(p"[s_send_meta] Invalidated background search result for L${currentLevelReg}C${chunkIndexReg}\n")
             }
             
             // Clear processing flag when chunk is complete
@@ -975,18 +948,18 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                                      Mux(level0SourceMacValid, level0SourceMac, IceNetConsts.ETH_BCAST_MAC))
             // Destination MAC should already be set before entering s_send_meta state
             // This printf is just for verification (should match what was set at transition)
-            SynthesizePrintf {
-                printf("[s_send_meta] Sent: myRank=%d, currentLevel=%d, chunk=%d, nextLevel=%d\n",
-                    myRank, currentLevelReg, chunkIndexReg, nextLevel)
-            }
+            // SynthesizePrintf {
+            //     printf("[s_send_meta] Sent: myRank=%d, currentLevel=%d, chunk=%d, nextLevel=%d\n",
+            //         myRank, currentLevelReg, chunkIndexReg, nextLevel)
+            // }
             
             state                   := s_send_meta2
         }.elsewhen(io.out.valid && !io.out.ready) {
             // Track when output is not ready
             outputNotReadyCount     := outputNotReadyCount + 1.U
-            when(outputNotReadyCount(7, 0) === 0.U) { // Print every 256 cycles
-                dprintf(p"[s_send_meta] Output not ready, backpressure count: ${outputNotReadyCount}\n")
-            }
+            // when(outputNotReadyCount(7, 0) === 0.U) { // Print every 256 cycles
+            //     dprintf(p"[s_send_meta] Output not ready, backpressure count: ${outputNotReadyCount}\n")
+            // }
         }
         // Stay in this state until the output is accepted
     }
@@ -1008,9 +981,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         }.elsewhen(io.out.valid && !io.out.ready) {
             // Track when output is not ready
             outputNotReadyCount := outputNotReadyCount + 1.U
-            when(outputNotReadyCount(7, 0) === 0.U) { // Print every 256 cycles
-                dprintf(p"[s_send_meta2] Output not ready, backpressure count: ${outputNotReadyCount}\n")
-            }
+            // when(outputNotReadyCount(7, 0) === 0.U) { // Print every 256 cycles
+            //     dprintf(p"[s_send_meta2] Output not ready, backpressure count: ${outputNotReadyCount}\n")
+            // }
         }
         // Stay in this state until the output is accepted
     }
@@ -1049,18 +1022,18 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
         when(io.out.fire) {            
             when(isLastDataWord) {
-                dprintf(p"[s_send_data] Finished sending chunk ${chunkIndexReg} for level ${currentLevelReg}\n")
+                // dprintf(p"[s_send_data] Finished sending chunk ${chunkIndexReg} for level ${currentLevelReg}\n")
                 
-                // Check if this was the last level for this chunk
-                when(currentLevelReg === maxLevelReg) {
-                    dprintf(p"[s_send_data] Completed max level ${maxLevelReg} for chunk ${chunkIndexReg}\n")
-                }
+                // // Check if this was the last level for this chunk
+                // when(currentLevelReg === maxLevelReg) {
+                //     dprintf(p"[s_send_data] Completed max level ${maxLevelReg} for chunk ${chunkIndexReg}\n")
+                // }
                 
                 // Continue checking for more chunks to process
                 // Fast-track check: Does completing this chunk enable the next level?
                 val nextLevelChunkProcessable = (nextLevel < MAX_RECURSION_LEVEL.U) && canProcessChunk(nextLevel, chunkIndexReg)
                 when(nextLevelChunkProcessable) {
-                    dprintf(p"[s_send_data] FAST-TRACK: Completing L${currentLevelReg}C${chunkIndexReg} enables next level L${nextLevel}C${chunkIndexReg}\n")
+                    // dprintf(p"[s_send_data] FAST-TRACK: Completing L${currentLevelReg}C${chunkIndexReg} enables next level L${nextLevel}C${chunkIndexReg}\n")
                     // Set up for immediate processing
                     processingChunkIndex    := chunkIndexReg
                     processingLevel         := nextLevel
@@ -1080,9 +1053,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         }.elsewhen(io.out.valid && !io.out.ready) {
             // Track when output is not ready
             outputNotReadyCount     := outputNotReadyCount + 1.U
-            when(outputNotReadyCount(7, 0) === 0.U) { // Print every 256 cycles
-                dprintf(p"[s_send_data] Output not ready, backpressure count: ${outputNotReadyCount}, word: ${sentDataWordCount}\n")
-            }
+            // when(outputNotReadyCount(7, 0) === 0.U) { // Print every 256 cycles
+            //     dprintf(p"[s_send_data] Output not ready, backpressure count: ${outputNotReadyCount}, word: ${sentDataWordCount}\n")
+            // }
         }
         // Stay in this state until the current word is accepted
     }
@@ -1098,7 +1071,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Found a free block! Latch it and pause searching.
             foundBlockValid := true.B
             foundBlockIndex := allocSearchPtr
-            dprintf(p"[BG_ALLOC] Found and latched free block index ${allocSearchPtr}\n")
+            // dprintf(p"[BG_ALLOC] Found and latched free block index ${allocSearchPtr}\n")
         } .otherwise {
             // Block is busy, move to the next index for the next cycle
             allocSearchPtr := allocSearchPtr + 1.U // Wraps around automatically
@@ -1117,12 +1090,12 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             foundChunkValid := true.B
             foundChunkLevel := chunkSearchLevel
             foundChunkIndex := chunkSearchChunk
-            dprintf(p"[BG_CHUNK] Found and latched processable chunk C${chunkSearchChunk} at L${chunkSearchLevel}\n")
+            // dprintf(p"[BG_CHUNK] Found and latched processable chunk C${chunkSearchChunk} at L${chunkSearchLevel}\n")
         } .otherwise {
             // Either chunk is not processable OR it's currently being processed - advance search pointer
-            when(currentChunkProcessable && currentlyProcessingThisChunk) {
-                dprintf(p"[BG_CHUNK] Found chunk C${chunkSearchChunk} at L${chunkSearchLevel} but it's currently being processed, skipping\n")
-            }
+            // when(currentChunkProcessable && currentlyProcessingThisChunk) {
+            //     dprintf(p"[BG_CHUNK] Found chunk C${chunkSearchChunk} at L${chunkSearchLevel} but it's currently being processed, skipping\n")
+            // }
             
             // Advance search pointer
             val nextChunk = chunkSearchChunk + 1.U
