@@ -6,7 +6,7 @@ import org.chipsalliance.cde.config.{Parameters, Field, Config}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
-import icenet.{NICKey, NICIOvonly, IceNetConsts, StreamChannel, StreamIO}
+import icenet.{NICKey, NICIOvonly, IceNetConsts, StreamChannel, StreamIO, MiniFloatAdder}
 import hardfloat._
 // import midas.targetutils.SynthesizePrintf
 
@@ -75,7 +75,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         val nodeRank = Output(UInt(8.W)) // Output driven by internal register
     })
     // Elabor-time debug helper (no hardware cost when disabled)
-    // private val dbgEnabled: Boolean = outer.params.EnableDebug
+    private val dbgEnabled: Boolean = outer.params.EnableDebug
     // @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
     
     // Get the TileLink client interface
@@ -89,18 +89,79 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     io.nodeRank := myRankReg // Drive the output for NIC to use
     private val AccelMacOffset = 0x22.U(8.W)
 
-    // --- FPU Instantiation ---
-    // Instantiate a single-precision floating-point adder.
-    // Single precision: exponent = 8, significand = 24 (23 stored + 1 implicit)
-    val fpAdder                 = Module(new AddRecFN(expWidth = 8, sigWidth = 24))
+    // --- FP Format Codes (stored in metadata byte 4) ---
+    private val FP_FORMAT_FP32     = 0x00.U(8.W)
+    private val FP_FORMAT_BFLOAT16 = 0x01.U(8.W)
+    private val FP_FORMAT_DLFLOAT  = 0x02.U(8.W)
+    
+    // --- FP Format Parameters ---
+    // FP32:     sign[31], exp[30:23] (8 bits), sig[22:0] (23+1 implicit = 24)
+    // BFloat16: sign[15], exp[14:7]  (8 bits), mant[6:0]  (7 bits)
+    // DLFloat:  sign[15], exp[14:9]  (6 bits), mant[8:0]  (9 bits)
+    private val FP32_EXP_WIDTH  = 8
+    private val FP32_SIG_WIDTH  = 24
+    private val BF16_EXP_WIDTH  = 8
+    private val BF16_MANT_WIDTH = 7   // Mantissa bits (not including hidden bit)
+    private val DLF_EXP_WIDTH   = 6
+    private val DLF_MANT_WIDTH  = 9   // Mantissa bits (not including hidden bit)
+    
+    // Elements per chunk by format (constant 1KB payload)
+    private val NUM_ELEMENTS_FP32  = 256   // 256 * 4 = 1024 bytes
+    private val NUM_ELEMENTS_16BIT = 512   // 512 * 2 = 1024 bytes
+    
+    // --- FPU Instantiation - Parallel Multi-Format Adders ---
+    // Process a full 64-bit word per cycle:
+    // - FP32: 2 elements per word -> 2 Hardfloat adders
+    // - 16-bit: 4 elements per word -> 4 MiniFloatAdders each for BF16 and DLFloat
+    private val NUM_FP32_ADDERS = 2
+    private val NUM_16BIT_ADDERS = 4
+    
+    // FP32 uses Hardfloat (works fine with sigWidth=24)
+    val fpAddersFP32 = Seq.fill(NUM_FP32_ADDERS)(Module(new AddRecFN(expWidth = FP32_EXP_WIDTH, sigWidth = FP32_SIG_WIDTH)))
+    
+    // 16-bit formats use custom MiniFloatAdder (avoids Hardfloat's lowMask issues)
+    // BFloat16: IEEE-style semantics (isDLFloat=false, default)
+    // Enable debug on first adder only when needed (currently disabled for BF16)
+    val fpAddersBF16 = Seq.tabulate(NUM_16BIT_ADDERS)(i => Module(new MiniFloatAdder(
+      expWidth = BF16_EXP_WIDTH, mantWidth = BF16_MANT_WIDTH, isDLFloat = false, enableDebug = false)))
+    // DLFloat: Custom semantics (no subnormals, RNU rounding, e=63 mostly normal)
+    // Enable debug on first adder only to trace intermediate values
+    val fpAddersDLF  = Seq.tabulate(NUM_16BIT_ADDERS)(i => Module(new MiniFloatAdder(
+      expWidth = DLF_EXP_WIDTH, mantWidth = DLF_MANT_WIDTH, isDLFloat = true, enableDebug = (i == 0 && outer.params.EnableDebug))))
+    
+    // Default signals for FP32 Hardfloat adders
+    fpAddersFP32.foreach { adder =>
+        adder.io.a              := 0.U
+        adder.io.b              := 0.U
+        adder.io.roundingMode   := 0.U
+        adder.io.detectTininess := 0.U
+        adder.io.subOp          := false.B
+    }
+    
+    // Default signals for 16-bit MiniFloatAdders
+    (fpAddersBF16 ++ fpAddersDLF).foreach { adder =>
+        adder.io.a := 0.U
+        adder.io.b := 0.U
+    }
 
-    // Provide default values to prevent "not fully initialized" errors.
-    // These will be overridden when the FSM is in the s_fp_add_pipe state.
-    fpAdder.io.a                := 0.U
-    fpAdder.io.b                := 0.U
-    fpAdder.io.roundingMode     := 0.U
-    fpAdder.io.detectTininess   := 0.U
-    fpAdder.io.subOp            := false.B
+    // --- Operation Codes ---
+    private val OP_SUM     = 0x05.U(8.W)  // Sum all values
+    private val OP_AVERAGE = 0x06.U(8.W)  // Sum and average at final level
+    private val OP_SETUP   = 0xFE.U(8.W)  // Setup/warmup packet
+    
+    // --- Parameterized Divide by Power of 2 ---
+    // Generic function that works for any IEEE FP format by subtracting 'shift' from exponent
+    // Note: Does not handle subnormals or edge cases (sufficient for typical ML values)
+    def divideByPow2(value: UInt, shift: UInt, expWidth: Int, sigWidth: Int): UInt = {
+        val mantissaBits = sigWidth - 1  // sigWidth includes hidden bit
+        val totalBits = 1 + expWidth + mantissaBits
+        val sign = value(totalBits - 1)
+        val expMsb = totalBits - 2
+        val expLsb = mantissaBits
+        val exp = value(expMsb, expLsb)
+        val sig = value(expLsb - 1, 0)
+        Cat(sign, exp - shift, sig)
+    }
 
     // --- Constants ---
     val BYTES_PER_WORD          = outer.params.bytesPerWord
@@ -176,6 +237,17 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val currentLevelReg         = Reg(UInt(8.W))
     val chunkIndexReg           = Reg(UInt(32.W))
     val totalChunksReg          = Reg(UInt(32.W))
+    
+    // --- FP Format Register ---
+    // Latched from metadata byte 4 when collective ID changes
+    val fpFormatReg             = RegInit(FP_FORMAT_FP32)
+    
+    // Derived signals for element handling based on current format
+    val isFP32Format            = fpFormatReg === FP_FORMAT_FP32
+    val currentNumElements      = Mux(isFP32Format, NUM_ELEMENTS_FP32.U, NUM_ELEMENTS_16BIT.U)
+    val currentElementWidth     = Mux(isFP32Format, 32.U, 16.U)
+    val currentElementsPerWord  = Mux(isFP32Format, 2.U, 4.U)
+    val currentNumDataWords     = Mux(isFP32Format, (NUM_ELEMENTS_FP32 / 2).U, (NUM_ELEMENTS_16BIT / 4).U)  // Both = 128 words
     
     // Flag to track pending Setup ACK - set when Setup packet detected,
     // ACK sent after draining full incoming packet
@@ -282,7 +354,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         nextLevel(7,0),
         maxLevelReg(7,0),
         0.U(8.W),           // Reserved byte 5 (was sender rank debug field)
-        0.U(8.W),           // Reserved byte 4 (was dst MAC low debug field)
+        fpFormatReg(7,0),   // Byte 4: FP format (echo back the received format)
         operationReg,
         collectiveTypeReg,
         collectiveIdReg(15, 8),
@@ -305,7 +377,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             
             // Check for Setup Packet (OP_SETUP = 0xFE)
             // COMBINED SETUP+WARMUP: If collID=0xFFFF, send acknowledgment response
-            when(opCode === 0xFE.U) {
+            when(opCode === OP_SETUP) {
                 val newRank             = metaWord(47, 40) 
                 myRankReg               := newRank
                 
@@ -322,7 +394,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     // Prepare ACK response metadata (will send after draining incoming packet)
                     collectiveIdReg         := 0xFFFF.U
                     collectiveTypeReg       := 0.U
-                    operationReg            := 0xFE.U  // Echo Setup opCode to indicate ACK
+                    operationReg            := OP_SETUP  // Echo Setup opCode to indicate ACK
                     maxLevelReg             := 0.U
                     currentLevelReg         := 0.U  // nextLevel=currentLevelReg+1=1 for ACK response
                     chunkIndexReg           := 0.U
@@ -389,8 +461,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     chunkSearchChunk        := 0.U
                     foundChunkValid         := false.B
                     isProcessing            := false.B
+                    
+                    // Latch FP format from metadata byte 4 (bits [39:32])
+                    fpFormatReg             := metaWord(39, 32)
+                    // dprintf(p"[s_idle] New collective 0x${Hexadecimal(newCollectiveId)}: FP format=0x${Hexadecimal(metaWord(39, 32))} (0=FP32, 1=BF16, 2=DLF)\n")
                 }
-                
                 collectiveIdReg         := newCollectiveId
                 collectiveTypeReg       := metaWord(23, 16)
                 operationReg            := metaWord(31, 24)
@@ -398,6 +473,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 currentLevelReg         := metaWord(63, 56)
                 
                 // Transition to wait for the second metadata word
+                // dprintf(p"[s_idle] Transitioning to s_recv_meta2 for packet: L${metaWord(63, 56)} C(pending)\n")
                 state                   := s_recv_meta2
             }
             
@@ -437,7 +513,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             chunkIndexReg   := metaWord2(31, 0)
             totalChunksReg  := metaWord2(63, 32)
 
-            // dprintf(p"[s_recv_meta2] Received metaWord2: currentChunks = 0x${Hexadecimal(metaWord2(31, 0))} totalChunks = 0x${Hexadecimal(metaWord2(63, 32))}\n")
+            // dprintf(p"[s_recv_meta2] Received chunk=${metaWord2(31, 0)}, total=${metaWord2(63, 32)}, level=${currentLevelReg}\n")
             
             // Update total chunks for collective if this is the first chunk or if it's larger
             when(totalChunksForCollective === 0.U || totalChunksReg > totalChunksForCollective) {
@@ -452,6 +528,10 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
 
     .elsewhen(state === s_recv_data) {
+        // Receive data words one at a time
+        // when(incoming_fire && receivedDataWordCount === 0.U) {
+        //     dprintf(p"[s_recv_data] Started receiving data for L${currentLevelReg}C${chunkIndexReg}\n")
+        // }
         io.out.valid        := false.B
         when(incoming_fire) {
             val baseElementIndex = receivedDataWordCount * ELEMENTS_PER_WORD.U
@@ -490,6 +570,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             receivedDataWordCount := receivedDataWordCount + 1.U
 
             when(incoming_bits.last) {
+                // dprintf(p"[s_recv_data] Packet complete: L${currentLevelReg}C${chunkIndexReg}, ${receivedDataWordCount} words received\\n")
                 // Check if we need to send Setup ACK after draining this packet
                 when(pendingSetupAck) {
                     // SynthesizePrintf {
@@ -798,58 +879,135 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     .elsewhen(state === s_wait_read_done) {
         // Both input data and previous level data are now in buffers, ready for FPU
         // Note: Level 0 never reaches this state with our optimization
-        // dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition pipeline for level ${processingLevel}, chunk ${processingChunkIndex}\n")
+        // dprintf(p"[s_wait_read_done] Starting FP add for L${processingLevel}C${processingChunkIndex}, format=0x${Hexadecimal(fpFormatReg)}\n")
         // dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, memoryReadBuffer[0]=0x${Hexadecimal(memoryReadBuffer(0))}\n")
-
-        //     // Both input data and previous level data are now in buffers, ready for FPU
-        // dprintf(p"[s_wait_read_done] Both reads complete. Starting FP addition for L${processingLevel}C${processingChunkIndex}\n")
-
-        // // DEBUG: Print the first few elements of the input buffers to verify correctness
-        // dprintf(p"[s_wait_read_done] incomingDataBuffer[0]=0x${Hexadecimal(incomingDataBuffer(0))}, [1]=0x${Hexadecimal(incomingDataBuffer(1))}\n")
-        // dprintf(p"[s_wait_read_done] memoryReadBuffer[0]  =0x${Hexadecimal(memoryReadBuffer(0))}, [1]=0x${Hexadecimal(memoryReadBuffer(1))}\n")
-
 
         state           := s_fp_add_pipe
         elementIdx      := 0.U
     }
     
     .elsewhen(state === s_fp_add_pipe) {
-        // ACTION: Provide inputs, calculate sum, and store the result in the same cycle.
-        // Convert IEEE-754 inputs to HardFloat recoded format (combinational helpers)
-        val aRec        = hardfloat.recFNFromFN(8, 24, incomingDataBuffer(elementIdx))
-        val bRec        = hardfloat.recFNFromFN(8, 24, memoryReadBuffer(elementIdx))
-        fpAdder.io.a    := aRec
-        fpAdder.io.b    := bRec
+        // ACTION: Process a full 64-bit word per cycle using parallel adders.
+        // FP32: 2 elements per word using 2 adders
+        // 16-bit: 4 elements per word using 4 adders
         
-        // Set control signals
-        fpAdder.io.roundingMode   := "b000".U
-        fpAdder.io.detectTininess := 1.U
-        fpAdder.io.subOp          := false.B
-
-        // Since the FPU is combinational, the result is available immediately.
-        val sumRec      = fpAdder.io.out
-        val sum         = hardfloat.fNFromRecFN(8, 24, sumRec)
-        // Always store IEEE result to processedDataBuffer for immediate use
-        processedDataBuffer(elementIdx) := sum
+        // --- Format Detection ---
+        val isBF16 = fpFormatReg === FP_FORMAT_BFLOAT16
+        // Note: DLFloat is handled as .otherwise of isBF16 in the 16-bit branch
         
-        // DEBUG: Track elements 242-255 - the tail end where 244 fails
-        // when(elementIdx >= 242.U && elementIdx <= 255.U) {
-        //     SynthesizePrintf {
-        //         printf("[TAIL_FPU] L%d C%d e[%d]: a=0x%x, b=0x%x, sum=0x%x\n",
-        //                processingLevel, processingChunkIndex, elementIdx,
-        //                incomingDataBuffer(elementIdx), memoryReadBuffer(elementIdx), sum)
-        //     }
-        // }
+        // elementIdx now represents the WORD index (0 to 127 for all formats)
+        // Each word contains 2 FP32 elements or 4 16-bit elements
+        val wordIdx = elementIdx
+        
+        // --- Averaging Logic (computed once) ---
+        val isFinalLevel = processingLevel === maxLevelReg
+        val isAverageOp  = operationReg === OP_AVERAGE
+        val avgShift     = maxLevelReg  // log2(N) = maxLevel
+        
+        // === FP32 Processing: 2 elements per word ===
+        // Buffer layout: Vec(256, UInt(32.W)) - direct indexing with wordIdx*2 and wordIdx*2+1
+        // Only feed FP32 adders when format is FP32 to prevent garbage computation
+        when(isFP32Format) {
+            for (i <- 0 until NUM_FP32_ADDERS) {
+                val elemIdx = wordIdx * NUM_FP32_ADDERS.U + i.U
+                val elemA = incomingDataBuffer(elemIdx)
+                val elemB = memoryReadBuffer(elemIdx)
+                
+                val aRec = hardfloat.recFNFromFN(FP32_EXP_WIDTH, FP32_SIG_WIDTH, elemA)
+                val bRec = hardfloat.recFNFromFN(FP32_EXP_WIDTH, FP32_SIG_WIDTH, elemB)
+                
+                fpAddersFP32(i).io.a              := aRec
+                fpAddersFP32(i).io.b              := bRec
+                fpAddersFP32(i).io.roundingMode   := "b000".U
+                fpAddersFP32(i).io.detectTininess := 1.U
+                fpAddersFP32(i).io.subOp          := false.B
+            }
+        }.otherwise {
+            // === 16-bit Processing: 4 elements per word ===
+            // Buffer layout: Vec(256, UInt(32.W)) - each 32-bit slot holds 2 x 16-bit values
+            // Word N contains elements at buffer slots wordIdx*2 and wordIdx*2+1
+            // Slot wordIdx*2: lower half = element 0, upper half = element 1
+            // Slot wordIdx*2+1: lower half = element 2, upper half = element 3
+            for (i <- 0 until NUM_16BIT_ADDERS) {
+                val bufIdx = wordIdx * 2.U + (i / 2).U  // Which 32-bit buffer slot
+                val isUpperHalf = (i % 2) == 1         // Which half of the 32-bit slot
+                
+                val slotA = incomingDataBuffer(bufIdx)
+                val slotB = memoryReadBuffer(bufIdx)
+                
+                val elemA_16 = if (isUpperHalf) slotA(31, 16) else slotA(15, 0)
+                val elemB_16 = if (isUpperHalf) slotB(31, 16) else slotB(15, 0)
+                
+                // MiniFloatAdder uses direct IEEE format - no recoding needed!
+                // BFloat16 adders
+                fpAddersBF16(i).io.a := elemA_16
+                fpAddersBF16(i).io.b := elemB_16
+                
+                // DLFloat adders
+                fpAddersDLF(i).io.a := elemA_16
+                fpAddersDLF(i).io.b := elemB_16
+            }
+        }
+        
+        // === Store Results ===
+        when(isFP32Format) {
+            // Store 2 FP32 results per cycle
+            for (i <- 0 until NUM_FP32_ADDERS) {
+                val elemIdx = wordIdx * NUM_FP32_ADDERS.U + i.U
+                val sumIEEE = hardfloat.fNFromRecFN(FP32_EXP_WIDTH, FP32_SIG_WIDTH, fpAddersFP32(i).io.out)
+                val result = Mux(isFinalLevel && isAverageOp,
+                                divideByPow2(sumIEEE, avgShift, FP32_EXP_WIDTH, FP32_SIG_WIDTH),
+                                sumIEEE)
+                processedDataBuffer(elemIdx) := result
+            }
+        }.otherwise {
+            // Store 4 x 16-bit results per cycle (packed into 2 x 32-bit slots)
+            // Results 0,1 go to slot wordIdx*2; results 2,3 go to slot wordIdx*2+1
+            // MiniFloatAdder outputs direct IEEE format - no conversion needed!
+            for (slotOffset <- 0 until 2) {
+                val bufIdx = wordIdx * 2.U + slotOffset.U
+                
+                // Two 16-bit results per 32-bit slot (direct from MiniFloatAdder)
+                val sumLow = Mux(isBF16,
+                    fpAddersBF16(slotOffset * 2).io.result,
+                    fpAddersDLF(slotOffset * 2).io.result)
+                val sumHigh = Mux(isBF16,
+                    fpAddersBF16(slotOffset * 2 + 1).io.result,
+                    fpAddersDLF(slotOffset * 2 + 1).io.result)
+                
+                // Apply averaging if needed (divideByPow2 expects sigWidth = mantWidth + 1)
+                val resultLow = Mux(isFinalLevel && isAverageOp,
+                    Mux(isBF16,
+                        divideByPow2(sumLow, avgShift, BF16_EXP_WIDTH, BF16_MANT_WIDTH + 1),
+                        divideByPow2(sumLow, avgShift, DLF_EXP_WIDTH, DLF_MANT_WIDTH + 1)),
+                    sumLow)
+                val resultHigh = Mux(isFinalLevel && isAverageOp,
+                    Mux(isBF16,
+                        divideByPow2(sumHigh, avgShift, BF16_EXP_WIDTH, BF16_MANT_WIDTH + 1),
+                        divideByPow2(sumHigh, avgShift, DLF_EXP_WIDTH, DLF_MANT_WIDTH + 1)),
+                    sumHigh)
+                
+                processedDataBuffer(bufIdx) := Cat(resultHigh(15, 0), resultLow(15, 0))
+            }
+            
+            // Debug: Print first word's 16-bit adder inputs/outputs
+            when(wordIdx === 0.U) {
+                val a0 = fpAddersBF16(0).io.a
+                val b0 = fpAddersBF16(0).io.b
+                val r0 = Mux(isBF16, fpAddersBF16(0).io.result, fpAddersDLF(0).io.result)
+                // dprintf(p"[s_fp_add_pipe] 16-bit word0: isBF16=${isBF16}, a=0x${Hexadecimal(a0)}, b=0x${Hexadecimal(b0)}, result=0x${Hexadecimal(r0)}\n")
+            }
+        }
 
-        // TRANSITION: When the last element is processed, move to the next state.
-        when(elementIdx === (NUM_DATA_ELEMENTS - 1).U) {
-            // dprintf(p"[s_fp_add_pipe] All FP results collected.\n")
-            // dprintf(p"[s_fp_add_pipe] processedDataBuffer[0]=0x${Hexadecimal(processedDataBuffer(0))}, [1]=0x${Hexadecimal(processedDataBuffer(1))}\n")
-            // dprintf(p"[s_fp_add_pipe] Last FP sum: 0x${Hexadecimal(sum)}\n")
+        // TRANSITION: When the last word is processed, move to the next state.
+        // Always 128 words per chunk (256 FP32 elements / 2 = 128, or 512 16-bit elements / 4 = 128)
+        val NUM_WORDS_PER_CHUNK = 128
+        when(elementIdx === (NUM_WORDS_PER_CHUNK - 1).U) {
+            // dprintf(p"[s_fp_add_pipe] FP add complete for L${processingLevel}C${processingChunkIndex}, processedDataBuffer[0]=0x${Hexadecimal(processedDataBuffer(0))}\n")
             
             when(processingLevel < maxLevelReg) {
                 // Store processed data back to memory
-                // dprintf(p"[s_fp_add_pipe] Chunk ${processingChunkIndex} FPU complete for L${processingLevel}. Checking allocator...\n")
+                // dprintf(p"[s_fp_add_pipe] Storing processed data to memory and checking allocator...\n")
                 
                 // Set up info needed for DMA write *before* checking allocator
                 isStoringIncomingData   := false.B // This is always processed data

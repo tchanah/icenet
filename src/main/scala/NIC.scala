@@ -1327,7 +1327,7 @@ object RecursiveDoublingWithDMAConnector {
     // ========================================================================================
     // Buffering: NIC/SimNetwork outputs are Valid (no backpressure). We must buffer them.
     // Queue size to handle packet bursts during processing (~4 packets worth)
-    val localCpuQueue     = Module(new Queue(chiselTypeOf(netio.out.bits), 1040))
+    val localCpuQueue     = Module(new Queue(chiselTypeOf(netio.out.bits), 260))
     localCpuQueue.io.enq.valid := netio.out.valid
     localCpuQueue.io.enq.bits  := netio.out.bits
     netio.out.ready       := localCpuQueue.io.enq.ready  // Backpressure to NIC core
@@ -1339,8 +1339,9 @@ object RecursiveDoublingWithDMAConnector {
     // }
 
     // Network input queue - size for packet bursts during processing
-    // Each packet is ~130 flits (2 meta + 128 data), so 530 entries = ~4 packets
-    val networkQueue      = Module(new Queue(chiselTypeOf(switchio.in.bits), 1040))
+    // For MAX_IN_FLIGHT=32: need to buffer bursts from 7 other nodes (~32 * 7 * 130 = ~29K flits)
+    // 4500 entries provides margin for MAX_IN_FLIGHT=32 operation
+    val networkQueue      = Module(new Queue(chiselTypeOf(switchio.in.bits), 4500))
     networkQueue.io.enq.valid := switchio.in.valid  // RX FROM Network
     networkQueue.io.enq.bits  := switchio.in.bits
     // NOTE: switchio is NICIOvonly (ValidIO) - no ready signal, no backpressure possible
@@ -1438,7 +1439,7 @@ object RecursiveDoublingWithDMAConnector {
         val dstMac    = UInt(ETH_MAC_BITS.W)
     }
     
-    val outQueue = Module(new Queue(new OutputBundle, 1040))
+    val outQueue = Module(new Queue(new OutputBundle, 260))
     outQueue.io.enq.valid           := wrapperModule.io.net_out.valid
     outQueue.io.enq.bits.net        := wrapperModule.io.net_out.bits
     outQueue.io.enq.bits.dstMac     := wrapperModule.io.dstMacAddr // Sampled at enq time (correct)
