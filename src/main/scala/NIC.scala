@@ -1077,6 +1077,112 @@ object MacUtils {
 }
 
 /**
+ * Stale Packet Filter Module
+ * Sits between the EthernetHeaderExtractor and the accelerator to filter out
+ * stale packets from previous collective iterations at line speed.
+ * 
+ * After header extraction, the first payload word is metadata word 1 with:
+ *   - bits[15:0]  = collective_id
+ *   - bits[31:24] = opCode (0xFE = Setup)
+ *
+ * The filter independently tracks the latest collective ID. Packets with an
+ * old collective ID are consumed and discarded without ever reaching the
+ * accelerator, preventing it from wasting cycles draining them.
+ *
+ * For valid (non-stale) packets, the filter is combinationally transparent
+ * (zero additional latency).
+ */
+class StalePacketFilter(dataWidth: Int) extends Module {
+    val io = IO(new Bundle {
+        val in  = Flipped(Decoupled(new StreamChannel(dataWidth)))
+        val out = Decoupled(new StreamChannel(dataWidth))
+    })
+
+    // Track the latest collective ID seen
+    // 0xFFFF is the sentinel value meaning "accept anything" (matches accelerator convention)
+    val latestCollectiveId = RegInit(0xFFFF.U(16.W))
+
+    // FSM states
+    val s_inspect :: s_pass :: s_drain :: Nil = Enum(3)
+    val state = RegInit(s_inspect)
+
+    // Op code for Setup packets (always pass through regardless of collective ID)
+    val OP_SETUP = 0xFE.U(8.W)
+
+    // Default outputs
+    io.in.ready  := false.B
+    io.out.valid := false.B
+    io.out.bits  := io.in.bits
+
+    switch(state) {
+        is(s_inspect) {
+            // First word after header extraction = metadata word 1
+            // Inspect it combinationally and decide pass vs drain in the same cycle
+            when(io.in.valid) {
+                val collectiveId = io.in.bits.data(15, 0)
+                val opCode       = io.in.bits.data(31, 24)
+
+                val isSetup = opCode === OP_SETUP
+                val isCurrent = collectiveId === latestCollectiveId
+                val isNewer = (collectiveId > latestCollectiveId) || (latestCollectiveId === 0xFFFF.U)
+                val shouldPass = isSetup || isCurrent || isNewer
+
+                when(shouldPass) {
+                    // PASS: Forward this word to downstream, zero extra latency
+                    io.out.valid := true.B
+                    io.in.ready  := io.out.ready  // Backpressure from downstream
+
+                    when(io.in.fire) {
+                        // Update latestCollectiveId if this is a newer data packet
+                        when(!isSetup && isNewer) {
+                            latestCollectiveId := collectiveId
+                        }
+                        // If this is a single-word packet, go back to inspect
+                        when(io.in.bits.last) {
+                            state := s_inspect
+                        }.otherwise {
+                            state := s_pass
+                        }
+                    }
+                }.otherwise {
+                    // DRAIN: Consume this stale word, don't forward
+                    io.in.ready  := true.B
+                    io.out.valid := false.B
+
+                    when(io.in.fire) {
+                        when(io.in.bits.last) {
+                            state := s_inspect  // Single-word stale packet done
+                        }.otherwise {
+                            state := s_drain
+                        }
+                    }
+                }
+            }
+        }
+
+        is(s_pass) {
+            // Forward remaining words of a valid packet
+            io.out.valid := io.in.valid
+            io.in.ready  := io.out.ready
+
+            when(io.in.fire && io.in.bits.last) {
+                state := s_inspect
+            }
+        }
+
+        is(s_drain) {
+            // Consume remaining words of a stale packet at wire speed
+            io.in.ready  := true.B
+            io.out.valid := false.B
+
+            when(io.in.fire && io.in.bits.last) {
+                state := s_inspect
+            }
+        }
+    }
+}
+
+/**
  * Ethernet Header Extractor Module
  * Extracts Ethernet headers from incoming packets and provides the source MAC address.
  * The Ethernet header words are removed from the stream so the accelerator receives payload only.
@@ -1339,9 +1445,9 @@ object RecursiveDoublingWithDMAConnector {
     // }
 
     // Network input queue - size for packet bursts during processing
-    // For MAX_IN_FLIGHT=32: need to buffer bursts from 7 other nodes (~32 * 7 * 130 = ~29K flits)
-    // 4500 entries provides margin for MAX_IN_FLIGHT=32 operation
-    val networkQueue      = Module(new Queue(chiselTypeOf(switchio.in.bits), 4500))
+    // For MAX_IN_FLIGHT=16: 50 packets × 130 flits = 6500 entries
+    // StalePacketFilter drains stale packets at wire speed, so overflow is mitigated
+    val networkQueue      = Module(new Queue(chiselTypeOf(switchio.in.bits), 6500))
     networkQueue.io.enq.valid := switchio.in.valid  // RX FROM Network
     networkQueue.io.enq.bits  := switchio.in.bits
     // NOTE: switchio is NICIOvonly (ValidIO) - no ready signal, no backpressure possible
@@ -1412,10 +1518,12 @@ object RecursiveDoublingWithDMAConnector {
     // Set Connector/SimNetwork identity to Accel MAC
     switchio.macAddr    := accelMac
 
-    // REMOVED: inQueue (post-extractor) is redundant.
-    // We already buffered at the Input (localCpuQueue, networkQueue).
-    // Direct connection Extractor -> Module
-    wrapperModule.io.net_in <> headerExtractor.io.out
+    // Stale Packet Filter: sits between header extractor and accelerator.
+    // Independently tracks collective IDs and drains stale packets at line speed.
+    // Valid packets pass through with zero additional latency (combinational).
+    val staleFilter = Module(new StalePacketFilter(NET_IF_WIDTH))
+    staleFilter.io.in       <> headerExtractor.io.out
+    wrapperModule.io.net_in <> staleFilter.io.out
     
     // wrapperModule.io.nodeRank is now an OUTPUT, used to drive derivedNodeRank above.
     // So we do NOT drive it here.
@@ -1439,6 +1547,7 @@ object RecursiveDoublingWithDMAConnector {
         val dstMac    = UInt(ETH_MAC_BITS.W)
     }
     
+    // TX path is sequential (1 packet at a time), 2 packets buffer is sufficient
     val outQueue = Module(new Queue(new OutputBundle, 260))
     outQueue.io.enq.valid           := wrapperModule.io.net_out.valid
     outQueue.io.enq.bits.net        := wrapperModule.io.net_out.bits
