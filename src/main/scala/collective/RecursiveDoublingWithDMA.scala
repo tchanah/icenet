@@ -269,7 +269,17 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     
     // Add counter for tracking output backpressure
     val outputNotReadyCount     = RegInit(0.U(32.W))
-    
+
+    // --- Stage C: per-state cycle accounting (Verilator diagnostic, EnableDebug-gated print) ---
+    // Attributes where a collective's cycles go, so a small-TLRAM slowdown can be confirmed as
+    // memory-reuse stall (cyc_memstall) rather than something else. Reset at each new collective.
+    val cyc_total    = RegInit(0.U(64.W))
+    val cyc_memstall = RegInit(0.U(64.W))  // no free block (numFreeBlocks===0) OR waiting in s_wait_alloc
+    val cyc_dma      = RegInit(0.U(64.W))  // s_dma_*/s_wait_* (TileLink read/write round-trips)
+    val cyc_fpadd    = RegInit(0.U(64.W))  // s_fp_add_pipe
+    val cyc_send     = RegInit(0.U(64.W))  // s_send_*
+    val statReset    = WireDefault(false.B) // pulsed in s_idle when a new collective is detected
+
     // Separate counters for read requests and responses
     val readReqCount            = RegInit(0.U(outer.params.wordCountBits.W))
     val readWordCount           = RegInit(0.U(outer.params.wordCountBits.W)) // used as response count
@@ -465,6 +475,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     // Latch FP format from metadata byte 4 (bits [39:32])
                     fpFormatReg             := metaWord(39, 32)
                     // dprintf(p"[s_idle] New collective 0x${Hexadecimal(newCollectiveId)}: FP format=0x${Hexadecimal(metaWord(39, 32))} (0=FP32, 1=BF16, 2=DLF)\n")
+
+                    // Stage C: restart per-state cycle accounting for the new collective
+                    statReset               := true.B
                 }
                 collectiveIdReg         := newCollectiveId
                 collectiveTypeReg       := metaWord(23, 16)
@@ -1073,6 +1086,17 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         outgoing_bits.keep      := (~0.U((outer.params.dataWidth / 8).W))
 
         when(io.out.fire) {
+            // Stage C: on each FINAL-level response, dump cumulative per-state cycle accounting.
+            // Values are cumulative within the collective; the last such line before the next
+            // collective is the full breakdown. Verilator-only (plain printf, EnableDebug-gated).
+            // Skip the SETUP ACK (collId 0xFFFF): it also has currentLevelReg===maxLevelReg===0
+            // but is not a real collective (statReset never fired, so its cyc_* are meaningless).
+            if (dbgEnabled) {
+                when(currentLevelReg === maxLevelReg && collectiveIdReg =/= 0xFFFF.U) {
+                    printf("STATE_CYCLES collId=0x%x chunk=%d total=%d memstall=%d dma=%d fpadd=%d send=%d\n",
+                        collectiveIdReg, chunkIndexReg, cyc_total, cyc_memstall, cyc_dma, cyc_fpadd, cyc_send)
+                }
+            }
             // Mark chunk as complete and start sending response
             // Note: set processed bit here (responses do not go to DMA write)
             {
@@ -1219,6 +1243,24 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
     
     
+    // --- Stage C: per-state cycle accounting (runs every cycle; statReset has priority) ---
+    // Module-scope so it accumulates regardless of which FSM state we are in.
+    when(statReset) {
+        cyc_total    := 0.U
+        cyc_memstall := 0.U
+        cyc_dma      := 0.U
+        cyc_fpadd    := 0.U
+        cyc_send     := 0.U
+    } .otherwise {
+        cyc_total := cyc_total + 1.U
+        when(numFreeBlocks === 0.U || state === s_wait_alloc) { cyc_memstall := cyc_memstall + 1.U }
+        when(state === s_dma_read  || state === s_wait_read || state === s_wait_read_done ||
+             state === s_dma_write || state === s_wait_write)  { cyc_dma   := cyc_dma   + 1.U }
+        when(state === s_fp_add_pipe)                          { cyc_fpadd := cyc_fpadd + 1.U }
+        when(state === s_send_meta || state === s_send_meta2 ||
+             state === s_send_data)                            { cyc_send  := cyc_send  + 1.U }
+    }
+
     // --- Background Memory Block Allocator ---
     // This runs concurrently and continuously searches for a free memory block
     // whenever one hasn't already been found and latched.

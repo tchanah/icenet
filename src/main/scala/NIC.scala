@@ -975,23 +975,31 @@ class RecursiveDoublingWithDMAWrapper(implicit p: Parameters) extends LazyModule
   // private val dbgEnabled: Boolean = p.lift(RecursiveDoublingWithDMAKey).flatten.map(_.EnableDebug).getOrElse(false)
   // @inline private def dprintf(msg: Printable): Unit = if (dbgEnabled) { printf(msg) }
   
-  // Dedicated RAM subsystem for DMA operations
-  // This RAM is used by the RecursiveDoublingWithDMA accelerator to store:
-  // - Input data received from the network
-  // - Intermediate computation results
-  // - Output data to be sent back to the network
-  val ram = LazyModule(new TLRAM(
-    address     = AddressSet(0x80000000L, 0x400000L - 1), // 4MB address space starting at 2GB
-    beatBytes   = 8, // 8-byte transfers to match NET_IF_BYTES for efficient network data handling
-    devName     = Some("recursive-doubling-dma-ram")
-  ))
-  
   // Extract configuration parameters for the RecursiveDoublingWithDMA accelerator
   // These parameters control the accelerator's behavior and resource allocation
   val rdParams = p.lift(RecursiveDoublingWithDMAKey).flatten.getOrElse(
     throw new Exception("RecursiveDoublingWithDMAParams not found. Did you add WithRecursiveDoublingWithDMA to your Config?")
   )
-  
+
+  // Dedicated RAM subsystem for DMA operations
+  // This RAM is used by the RecursiveDoublingWithDMA accelerator to store:
+  // - Input data received from the network
+  // - Intermediate computation results
+  // - Output data to be sent back to the network
+  // Size is DERIVED from the allocator's block count so TLRAM and numMemoryBlocks stay in lockstep.
+  // bytesPerChunk is the SAME stride the accelerator uses to address blocks
+  // (RecursiveDoublingWithDMA.scala: baseAddr + (blockIndex << log2Ceil(BYTES_PER_CHUNK))), so
+  //   span = numMemoryBlocks * bytesPerChunk
+  // is exactly the address range the allocator can touch — consistent by construction.
+  // baseMemoryAddr (params :20) and bytesPerChunk (params :45) are public members of rdParams.
+  // Keep numMemoryBlocks a power of 2 so the span is a valid AddressSet mask.
+  val ramSpanBytes = rdParams.numMemoryBlocks.toLong * rdParams.bytesPerChunk
+  val ram = LazyModule(new TLRAM(
+    address     = AddressSet(rdParams.baseMemoryAddr, ramSpanBytes - 1),
+    beatBytes   = 8, // 8-byte transfers to match NET_IF_BYTES for efficient network data handling
+    devName     = Some("recursive-doubling-dma-ram")
+  ))
+
   // Instantiate the main RecursiveDoublingWithDMA accelerator module
   val recursiveDoublingDMA = LazyModule(new RecursiveDoublingWithDMA(rdParams))
   
