@@ -276,20 +276,12 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // Add counter for tracking output backpressure
     val outputNotReadyCount     = RegInit(0.U(32.W))
 
-    // --- Stage C: per-state cycle accounting (Verilator diagnostic, EnableStats-gated) ---
-    // Attributes where a collective's cycles go. Reset at each new collective.
-    //
-    // These are a COMPLETE, DISJOINT partition of cyc_total:
+    // --- Per-state cycle accounting (EnableStats-gated), reset at each new collective ---
+    // The first six are a complete, disjoint partition of cyc_total:
     //     idle + recv + dma + fpadd + send + waitalloc === total
-    // so every run is self-checking; a mismatch means an FSM state was added and these went stale.
-    //
-    // poolempty is deliberately OUTSIDE that partition: it is state-independent and overlaps the
-    // others. The previous single cyc_memstall counter OR'd poolempty with s_wait_alloc, which
-    // conflated "the pool happens to be empty" with "we are actually blocked on memory" -- the
-    // first is common and harmless, only the second costs cycles. waitalloc is the real stall.
-    //
-    // Declared unconditionally but only driven/read inside `if (statsEnabled)` blocks, so with
-    // EnableStats=false nothing reads them and FIRRTL DCE strips them (verify in the emitted Verilog).
+    // The rest overlap it and must never be summed in.
+    // Declared unconditionally but only driven/read under `if (statsEnabled)`, so FIRRTL DCE
+    // strips them when stats are off.
     val cyc_total     = RegInit(0.U(32.W))
     val cyc_idle      = RegInit(0.U(32.W))  // s_idle
     val cyc_recv      = RegInit(0.U(32.W))  // s_recv_meta2 + s_recv_data
@@ -302,7 +294,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                                             // the exposed TileLink round-trip inside cyc_dma
     val cnt_in_stall_mem   = RegInit(0.U(32.W)) // io.in held off because no free block
     val cnt_in_stall_state = RegInit(0.U(32.W)) // io.in held off because the FSM is busy
-    val blocks_hwm    = RegInit(0.U((BLOCK_INDEX_BITS + 1).W)) // peak blocks in use = required TLRAM
+    val blocks_hwm    = RegInit(0.U((BLOCK_INDEX_BITS + 1).W)) // peak concurrent blocks in use
     val finalChunksDone = RegInit(0.U(CHUNK_INDEX_BITS.W))     // final-level responses sent this collective
     val statReset    = WireDefault(false.B) // pulsed in s_idle when a new collective is detected
 
@@ -1334,13 +1326,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val stateAcceptsIn = state === s_idle || state === s_recv_meta2 || state === s_recv_data
     io.in.ready     := stateAcceptsIn && memoryHasSpace
 
-    // --- Stage C accounting: cycle buckets, block residency, backpressure, summary print ---
-    // Runs every cycle; statReset has priority. Whole block is elaborated only when EnableStats.
+    // --- Stats accounting: cycle buckets, block residency, backpressure, summary print ---
+    // Runs every cycle; statReset has priority.
     if (statsEnabled) {
         val blocksInUse = NUM_MEM_BLOCKS.U((BLOCK_INDEX_BITS + 1).W) - numFreeBlocks
 
-        // A final-level response leaving the module. Skip the SETUP ACK (collId 0xFFFF): it also
-        // has currentLevelReg===maxLevelReg===0 but is not a real collective.
+        // A final-level response leaving the module. The collId test skips the SETUP ACK, which
+        // also has currentLevelReg === maxLevelReg === 0 but is not a real collective.
         val finalRespFire = (state === s_send_meta) && io.out.fire &&
                             (currentLevelReg === maxLevelReg) && (collectiveIdReg =/= 0xFFFF.U)
 
@@ -1358,7 +1350,6 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             cnt_in_stall_state := 0.U
             blocks_hwm         := 0.U
             finalChunksDone    := 0.U
-            // Existed and was incremented since forever, but was never reset and never printed.
             outputNotReadyCount := 0.U
         } .otherwise {
             cyc_total := cyc_total + 1.U
@@ -1375,27 +1366,24 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
             // --- overlapping diagnostics (NOT part of the partition) ---
             when(!memoryHasSpace)                            { cyc_poolempty := cyc_poolempty + 1.U }
-            // Exposed TileLink round-trip: sitting in a wait state with no response on the D channel.
-            // This is the portion of cyc_dma that request pipelining (source IDs) could recover.
+            // Exposed TileLink round-trip: the portion of cyc_dma spent waiting on the D channel.
             when((state === s_wait_read || state === s_wait_write) && !tl.d.valid) {
                 cyc_tl_dwait := cyc_tl_dwait + 1.U
             }
-            // Backpressure toward the NIC, split by cause. A too-small TLRAM does not stall the
-            // FSM -- it deasserts io.in.ready and pushes the cost upstream into the NIC's queues,
-            // which none of the cycle buckets above can see.
+            // Backpressure toward the NIC, split by cause: memory exhaustion deasserts io.in.ready
+            // without stalling the FSM, so no cycle bucket above can see it.
             when(io.in.valid && !memoryHasSpace)   { cnt_in_stall_mem   := cnt_in_stall_mem   + 1.U }
             when(io.in.valid && !stateAcceptsIn)   { cnt_in_stall_state := cnt_in_stall_state + 1.U }
 
-            // Peak block residency: this IS the required numMemoryBlocks for the current
-            // (CHUNKS, LAG, FORMAT) point, measurable in one run at a generous TLRAM size.
+            // Peak concurrent residency. Pins to NUM_MEM_BLOCKS whenever the pool fully empties,
+            // so it only measures a working set when it lands strictly below NUM_MEM_BLOCKS.
             when(blocksInUse > blocks_hwm) { blocks_hwm := blocksInUse }
 
             when(finalRespFire) { finalChunksDone := finalChunksDone + 1.U }
         }
 
-        // One line per collective, emitted as the last final-level response goes out.
-        // Counter values are pre-increment for this cycle, matching the last per-chunk
-        // STATE_CYCLES line exactly when EnableDebug is also on.
+        // One line per collective, as the last final-level response goes out. Values are
+        // pre-increment for this cycle, so they match the last per-chunk STATE_CYCLES line.
         when(finalRespFire && (finalChunksDone + 1.U === totalChunksForCollective)) {
             printf("STATE_SUMMARY collId=0x%x chunks=%d total=%d idle=%d recv=%d dma=%d fpadd=%d send=%d waitalloc=%d poolempty=%d tl_dwait=%d install_mem=%d install_state=%d outnotready=%d blocks_hwm=%d\n",
                 collectiveIdReg, totalChunksForCollective, cyc_total, cyc_idle, cyc_recv,
