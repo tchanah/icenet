@@ -271,8 +271,19 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // --- Counters ---
     val receivedDataWordCount   = RegInit(0.U(outer.params.wordCountBits.W))
     val sentDataWordCount       = RegInit(0.U(outer.params.wordCountBits.W))
+    // DMA counters are split so requests can pipeline: dmaWordCount / readWordCount count
+    // RETIRED beats and drive the completion tests, dmaIssueCount / readReqCount count
+    // ISSUED beats and drive each request's address, data and source.
     val dmaWordCount            = RegInit(0.U(outer.params.wordCountBits.W))
-    
+    val dmaIssueCount           = RegInit(0.U(outer.params.wordCountBits.W))
+
+    // Source IDs rotate as issueCount mod MAX_DMA_XACTS. That is only unique among in-flight
+    // requests while fewer than MAX_DMA_XACTS are outstanding, which the issue guards enforce.
+    private val MAX_DMA_XACTS   = outer.params.sourceIds
+    private val SRC_BITS        = log2Ceil(MAX_DMA_XACTS)
+    require(MAX_DMA_XACTS >= 2 && isPow2(MAX_DMA_XACTS),
+        s"sourceIds must be a power of 2 and at least 2 for the rotating source-ID scheme (got $MAX_DMA_XACTS)")
+
     // Add counter for tracking output backpressure
     val outputNotReadyCount     = RegInit(0.U(32.W))
 
@@ -341,7 +352,40 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     tl.a.valid                  := false.B
     tl.a.bits                   := DontCare
     tl.d.ready                  := false.B
-    
+
+    // --- DMA response retirement ---
+    // The s_dma_* states issue back-to-back and responses retire here, so a beat costs one
+    // cycle rather than a round trip. TLRAM declares fifoId = Some(0), so responses come back
+    // in request order: the retire counter alone indexes the destination and tl.d.bits.source
+    // is never consulted.
+    // Must stay BEFORE the FSM -- s_wait_read reassigns readWordCount on the phase-1 handoff
+    // and relies on last-connect to override the increment below.
+    val inWriteXfer  = state === s_dma_write || state === s_wait_write
+    val inReadXfer   = state === s_dma_read  || state === s_wait_read
+    when(inWriteXfer || inReadXfer) { tl.d.ready := true.B }
+
+    val writeAckFire = tl.d.fire && inWriteXfer && tl.d.bits.opcode === TLMessages.AccessAck
+    val readAckFire  = tl.d.fire && inReadXfer  && tl.d.bits.opcode === TLMessages.AccessAckData
+
+    when(writeAckFire) { dmaWordCount := dmaWordCount + 1.U }
+
+    when(readAckFire) {
+        val retiredWord = tl.d.bits.data
+        for (i <- 0 until ELEMENTS_PER_WORD) {
+            val elementIndex = readWordCount * ELEMENTS_PER_WORD.U + i.U
+            when(elementIndex < NUM_DATA_ELEMENTS.U) {
+                val extractedData = retiredWord((i + 1) * ELEMENT_WIDTH - 1, i * ELEMENT_WIDTH)
+                when(isReadingInputData) {
+                    incomingDataBuffer(elementIndex) := extractedData
+                }.otherwise {
+                    memoryReadBuffer(elementIndex)   := extractedData
+                }
+            }
+        }
+        readWordCount := readWordCount + 1.U
+    }
+
+
     // Dynamic addressing replaces static helper functions for address calculation
     
     // Helper function to check if all required chunks are available for processing
@@ -628,6 +672,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     }
                     // Reset counters regardless of next state
                     dmaWordCount            := 0.U
+                    dmaIssueCount           := 0.U
                     receivedDataWordCount   := 0.U
 
                     // Conditional debug print
@@ -647,20 +692,21 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
     
     .elsewhen(state === s_dma_write) {
-        // Write data to memory
-        when(dmaWordCount < WORDS_PER_CHUNK.U) {
+        // Write data to memory, issuing back-to-back up to the outstanding limit.
+        val writeOutstanding = dmaIssueCount - dmaWordCount
+        when(dmaIssueCount < WORDS_PER_CHUNK.U && writeOutstanding < MAX_DMA_XACTS.U) {
             tl.a.valid          := true.B
             tl.a.bits.opcode    := TLMessages.PutFullData
             tl.a.bits.param     := 0.U
             tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
-            tl.a.bits.source    := 0.U // Serialize writes
+            tl.a.bits.source    := dmaIssueCount(SRC_BITS-1, 0)
 
             // Calculate address dynamically based on the first available free block
             val baseAddr = outer.params.baseMemoryAddr.U + (blockIndexToWriteReg << log2Ceil(BYTES_PER_CHUNK).U)
-            tl.a.bits.address   := baseAddr + (dmaWordCount << log2Ceil(BYTES_PER_WORD).U)
+            tl.a.bits.address   := baseAddr + (dmaIssueCount << log2Ceil(BYTES_PER_WORD).U)
             tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
 
-            val baseElementIndex = dmaWordCount * ELEMENTS_PER_WORD.U
+            val baseElementIndex = dmaIssueCount * ELEMENTS_PER_WORD.U
             val dataWord        = Wire(UInt(outer.params.dataWidth.W))
             val dataSource      = Mux(isStoringIncomingData, incomingDataBuffer, processedDataBuffer)
             val dataVec         = Wire(Vec(ELEMENTS_PER_WORD, UInt(ELEMENT_WIDTH.W)))
@@ -672,7 +718,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
             when(tl.a.fire) {
                 // On the first word, update the memory management tables
-                when(dmaWordCount === 0.U) {
+                when(dmaIssueCount === 0.U) {
                     // Mark allocated block as busy in bitmap
                     {
                         val idx         = blockIndexToWriteReg(BLOCK_INDEX_BITS-1, 0)
@@ -732,19 +778,17 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 //     }
                 // }
                 
-                state           := s_wait_write
+                dmaIssueCount   := dmaIssueCount + 1.U
+                when(dmaIssueCount === (WORDS_PER_CHUNK - 1).U) {
+                    state       := s_wait_write   // last issued; drain acks there
+                }
             }
         }
     }
 
     .elsewhen(state === s_wait_write) {
-        // Wait for AccessAck of the Put before proceeding
-        tl.d.ready      := true.B
-        when(tl.d.valid && tl.d.bits.opcode === TLMessages.AccessAck && tl.d.bits.source === 0.U) {
-            // One write completed
-            val nextCount   = dmaWordCount + 1.U
-            dmaWordCount    := nextCount
-            when(nextCount === WORDS_PER_CHUNK.U) {
+        // All Puts issued; complete when the last ack retires.
+        when(writeAckFire && dmaWordCount === (WORDS_PER_CHUNK - 1).U) {
                 when(isStoringIncomingData) {
                     // The chunk data is now officially in memory.
                     // THIS is the correct place to set the arrived flag.
@@ -789,20 +833,19 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     
                     state                   := s_send_meta
                 }
-            }.otherwise {
-                state       := s_dma_write
-            }
         }
     }
-    
+
     .elsewhen(state === s_dma_read) {
-        // Read data from memory - address depends on what we're reading
-        when(readReqCount < WORDS_PER_CHUNK.U) {
+        // Read data from memory - address depends on what we're reading.
+        // Issued back-to-back up to the outstanding limit.
+        val readOutstanding = readReqCount - readWordCount
+        when(readReqCount < WORDS_PER_CHUNK.U && readOutstanding < MAX_DMA_XACTS.U) {
             tl.a.valid          := true.B
             tl.a.bits.opcode    := TLMessages.Get
             tl.a.bits.param     := 0.U
             tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
-            tl.a.bits.source    := 0.U
+            tl.a.bits.source    := readReqCount(SRC_BITS-1, 0)
             // Calculate the address from the base and block index
             val baseReadAddr = outer.params.baseMemoryAddr.U + (blockIndexInFlightReg << log2Ceil(BYTES_PER_CHUNK).U)
             val readAddr = baseReadAddr + (readReqCount << log2Ceil(BYTES_PER_WORD).U)
@@ -819,90 +862,42 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 //     }
                 // }
                 
-                state                   := s_wait_read
+                readReqCount            := readReqCount + 1.U
+                when(readReqCount === (WORDS_PER_CHUNK - 1).U) {
+                    // Last request issued; drain the outstanding responses in s_wait_read.
+                    state               := s_wait_read
+                }
             }
         }
     }
-    
+
     .elsewhen(state === s_wait_read) {
-        // Handle TileLink responses for level data read (one at a time)
-        tl.d.ready      := true.B
-        when(tl.d.valid && tl.d.bits.opcode === TLMessages.AccessAckData && tl.d.bits.source === 0.U) {
-            val dataWord    = tl.d.bits.data
-
-            // Only print for the first and last word of the DMA transfer.
-            // when(readWordCount === 0.U || readWordCount === (WORDS_PER_CHUNK.U - 1.U)) {
-            //     dprintf(p"[s_wait_read] DMA Read Response word ${readWordCount}: data=0x${Hexadecimal(dataWord)}\n")
-            // }
-
-            val wordIndex = readWordCount
-            // Unpack into appropriate buffer based on what we're reading
-            for (i <- 0 until ELEMENTS_PER_WORD) {
-                val elementIndex    = wordIndex * ELEMENTS_PER_WORD.U + i.U
-                when(elementIndex < NUM_DATA_ELEMENTS.U) {
-                    val elementStart    = i * ELEMENT_WIDTH
-                    val elementEnd      = elementStart + ELEMENT_WIDTH - 1
-                    val extractedData   = dataWord(elementEnd, elementStart)
-                    
-                    // Choose buffer based on what we're reading
-                    when(isReadingInputData) {
-                        incomingDataBuffer(elementIndex)    := extractedData
-                    }.otherwise {
-                        memoryReadBuffer(elementIndex)      := extractedData
-                    }
-                }
+        // All Gets issued; complete when the last response retires.
+        when(readAckFire && readWordCount === (WORDS_PER_CHUNK - 1).U) {
+            // Read phase complete. The data is now in internal buffers, so we can free the memory block.
+            // The block index was latched during the read request. Use the registered value.
+            {
+                val idx  = blockIndexInFlightReg(BLOCK_INDEX_BITS-1, 0)
+                val mask = (1.U(NUM_MEM_BLOCKS.W)) << idx
+                memFreeBitmap := memFreeBitmap | mask
             }
+            numFreeBlocks                       := numFreeBlocks + 1.U
 
-            // DEBUG: Track elements 242-255 (words 121-127) - the tail end where 244 fails
-            // when(readWordCount >= 121.U && readWordCount <= 127.U) {
-            //     val e0 = dataWord(ELEMENT_WIDTH-1, 0)
-            //     val e1 = dataWord(2*ELEMENT_WIDTH-1, ELEMENT_WIDTH)
-            //     val elemBase = readWordCount * 2.U
-            //     SynthesizePrintf {
-            //         printf("[TAIL_READ] L%d C%d w%d isInc=%d blk=%d: e[%d]=0x%x, e[%d]=0x%x\n",
-            //                processingLevel, processingChunkIndex, readWordCount,
-            //                isReadingInputData, blockIndexInFlightReg,
-            //                elemBase, e0, elemBase + 1.U, e1)
-            //     }
-            // }
+            // Now, determine next action
+            when(isReadingInputData) {
+                // Phase 1 complete, start Phase 2: read previous level data
+                // Note: Level 0 never reaches read states with our optimization
 
-            readWordCount   := readWordCount + 1.U
-            readReqCount    := readReqCount + 1.U
+                // Calculate and store the NEXT block index for the second read phase
+                blockIndexInFlightReg   := (processedBlockFields(processingLevel - 1.U) >> (processingChunkIndex * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
 
-
-            // If more words to fetch, issue next request; else proceed
-            when(readWordCount + 1.U < WORDS_PER_CHUNK.U) {
-                state       := s_dma_read
+                isReadingInputData  := false.B
+                readWordCount       := 0.U   // overrides the retirement increment
+                readReqCount        := 0.U
+                state               := s_dma_read
             }.otherwise {
-                // Read phase complete. The data is now in internal buffers, so we can free the memory block.
-                // The block index was latched during the read request. Use the registered value.
-                // Mark block as free again after read complete
-                {
-                    val idx  = blockIndexInFlightReg(BLOCK_INDEX_BITS-1, 0)
-                    val mask = (1.U(NUM_MEM_BLOCKS.W)) << idx
-                    memFreeBitmap := memFreeBitmap | mask
-                }
-                numFreeBlocks                       := numFreeBlocks + 1.U
-                // dprintf(p"[s_wait_read] Read complete. Freed block ${blockIndexInFlightReg}. Free blocks: ${numFreeBlocks + 1.U}\n")
-
-                // Now, determine next action
-                when(isReadingInputData) {
-                    // Phase 1 complete, start Phase 2: read previous level data
-                    // Note: Level 0 never reaches read states with our optimization
-                    // dprintf(p"[s_wait_read] Input data read complete, starting previous level read\n")
-
-                    // Calculate and store the NEXT block index for the second read phase
-                    blockIndexInFlightReg   := (processedBlockFields(processingLevel - 1.U) >> (processingChunkIndex * BLOCK_INDEX_BITS.U))(BLOCK_INDEX_BITS-1, 0)
-
-                    isReadingInputData  := false.B
-                    readWordCount       := 0.U
-                    readReqCount        := 0.U
-                    state               := s_dma_read
-                }.otherwise {
-                    // dprintf(p"[s_wait_read] Previous level data read complete, ready for FPU\n")
-                    // Both reads complete, proceed to FPU processing
-                    state               := s_wait_read_done
-                }
+                // Both reads complete, proceed to FPU processing
+                state               := s_wait_read_done
             }
         }
     }
@@ -1058,6 +1053,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 }
                 // Reset counter regardless of next state
                 dmaWordCount            := 0.U
+                dmaIssueCount           := 0.U
             }.otherwise {
                 // Final level - send response directly without storing
                 // dprintf(p"[s_fp_add_pipe] Final level chunk ${processingChunkIndex} complete, sending response directly\n")
