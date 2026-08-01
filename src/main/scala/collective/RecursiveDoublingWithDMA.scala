@@ -320,7 +320,19 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val nextLevel               = Wire(UInt(8.W))
     val isStoringIncomingData   = RegInit(false.B)     // Flag to distinguish storing incoming data vs processed data
     val isReadingInputData      = RegInit(false.B)        // Flag to distinguish reading input data vs previous level data
-    
+
+    // Write-through: armed in s_recv_meta2 at level > 0 when a block is already latched, so
+    // s_recv_data Puts each word as it lands instead of paying a separate s_dma_write pass.
+    val writeThroughActive      = RegInit(false.B)
+    // Gates tl.a.valid; io.in.ready adds tl.a.ready on top, joining the two handshakes.
+    // Excludes numFreeBlocks on purpose: the block is already claimed, and testing the pool here
+    // would deassert io.in.ready mid-chunk with nothing left running that could free a block.
+    val wtIssueAllowed          = (dmaIssueCount - dmaWordCount) < MAX_DMA_XACTS.U
+    // A packet may carry more than WORDS_PER_CHUNK data words -- s_recv_data guards its buffer
+    // writes with < NUM_DATA_ELEMENTS for exactly that. s_dma_write was immune; write-through
+    // must drop the tail or it runs past the block into its neighbour.
+    val wtInChunk               = dmaIssueCount < WORDS_PER_CHUNK.U
+
     // Default control signals
     nextLevel := currentLevelReg + 1.U
 
@@ -360,7 +372,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // is never consulted.
     // Must stay BEFORE the FSM -- s_wait_read reassigns readWordCount on the phase-1 handoff
     // and relies on last-connect to override the increment below.
-    val inWriteXfer  = state === s_dma_write || state === s_wait_write
+    val inWriteXfer  = state === s_dma_write || state === s_wait_write ||
+                       (state === s_recv_data && writeThroughActive)
     val inReadXfer   = state === s_dma_read  || state === s_wait_read
     when(inWriteXfer || inReadXfer) { tl.d.ready := true.B }
 
@@ -599,6 +612,27 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             // Start data word count at 0 since we just finished receiving the metadata word
             receivedDataWordCount   := 0.U
             state                   := s_recv_data
+
+            // Arm write-through if the allocator already has a block. Level 0 lands in
+            // processedDataBuffer and setup packets carry no chunk, so neither qualifies.
+            // With no block latched, fall through to the original buffer-then-write path so a
+            // starved allocator still drains the packet instead of stalling the RX queue.
+            when(currentLevelReg =/= 0.U && !pendingSetupAck && foundBlockValid) {
+                blockIndexToWriteReg    := foundBlockIndex
+                foundBlockValid         := false.B
+                allocSearchPtr          := foundBlockIndex + 1.U
+                isStoringIncomingData   := true.B
+                writeThroughActive      := true.B
+                dmaWordCount            := 0.U
+                dmaIssueCount           := 0.U
+
+                // Claim here, not on the first beat: that gap is a network gap of unbounded
+                // length, and while the bitmap still shows the block free the background
+                // allocator can wrap around and hand it out again.
+                val wtFreeMask  = (1.U(NUM_MEM_BLOCKS.W)) << foundBlockIndex(BLOCK_INDEX_BITS-1, 0)
+                memFreeBitmap   := memFreeBitmap & (~wtFreeMask)
+                numFreeBlocks   := numFreeBlocks - 1.U
+            }
         }
     }
 
@@ -608,6 +642,36 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         //     dprintf(p"[s_recv_data] Started receiving data for L${currentLevelReg}C${chunkIndexReg}\n")
         // }
         io.out.valid        := false.B
+
+        // Write-through: the arriving word goes to TLRAM in the same cycle it is buffered.
+        // While wtInChunk holds, io.in.ready carries tl.a.ready, so incoming_fire and tl.a.fire
+        // are the same event -- a word can never be consumed without being written.
+        when(writeThroughActive) {
+            tl.a.valid          := incoming_valid && wtIssueAllowed && wtInChunk
+            tl.a.bits.opcode    := TLMessages.PutFullData
+            tl.a.bits.param     := 0.U
+            tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
+            tl.a.bits.source    := dmaIssueCount(SRC_BITS-1, 0)
+
+            val wtBaseAddr      = outer.params.baseMemoryAddr.U + (blockIndexToWriteReg << log2Ceil(BYTES_PER_CHUNK).U)
+            tl.a.bits.address   := wtBaseAddr + (dmaIssueCount << log2Ceil(BYTES_PER_WORD).U)
+            tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
+            tl.a.bits.data      := incoming_bits.data
+
+            when(tl.a.fire) {
+                when(dmaIssueCount === 0.U) {
+                    // First beat records where this chunk lives; the block itself was claimed in
+                    // s_recv_meta2. Incoming-only, since write-through never arms at level 0.
+                    val wtShamtRaw  = (chunkIndexReg(CHUNK_INDEX_BITS-1, 0) * BLOCK_INDEX_BITS.U)
+                    val wtShamt     = wtShamtRaw(SHAMT_BITS-1, 0)
+                    val wtFieldMask = ~(((BigInt(1) << BLOCK_INDEX_BITS) - 1).U(BLOCK_FIELDS_PER_LEVEL_WIDTH.W) << wtShamt)
+                    val wtZext      = Cat(0.U((BLOCK_FIELDS_PER_LEVEL_WIDTH - BLOCK_INDEX_BITS).W), blockIndexToWriteReg.asUInt)
+                    incomingBlockFields(currentLevelReg) := (incomingBlockFields(currentLevelReg) & wtFieldMask) | (wtZext << wtShamt)
+                }
+                dmaIssueCount := dmaIssueCount + 1.U
+            }
+        }
+
         when(incoming_fire) {
             val baseElementIndex = receivedDataWordCount * ELEMENTS_PER_WORD.U
 
@@ -659,20 +723,27 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                     // Determine if storing incoming or processed (always incoming here, except L0)
                     isStoringIncomingData   := Mux(currentLevelReg === 0.U, false.B, true.B)
 
-                    // Check if allocator is ready
-                    when(foundBlockValid) { // Allocator has a block ready NOW
-                        // dprintf(p"[s_recv_data] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
-                        blockIndexToWriteReg    := foundBlockIndex
-                        foundBlockValid         := false.B
-                        allocSearchPtr          := foundBlockIndex + 1.U
-                        state                   := s_dma_write // Go directly to write
-                    } .otherwise { // Allocator not ready, need to wait
-                        // dprintf(p"[s_recv_data] Allocator not ready. Transitioning to s_wait_alloc.\n")
-                        state                   := s_wait_alloc // Go to waiting state
+                    when(writeThroughActive) {
+                        // Every Put already issued; only trailing acks left to drain, so the
+                        // counters must NOT be reset here.
+                        writeThroughActive      := false.B
+                        state                   := s_wait_write
+                    } .otherwise {
+                        // Check if allocator is ready
+                        when(foundBlockValid) { // Allocator has a block ready NOW
+                            // dprintf(p"[s_recv_data] Allocator ready. Latching block ${foundBlockIndex} and proceeding directly to DMA write.\n")
+                            blockIndexToWriteReg    := foundBlockIndex
+                            foundBlockValid         := false.B
+                            allocSearchPtr          := foundBlockIndex + 1.U
+                            state                   := s_dma_write // Go directly to write
+                        } .otherwise { // Allocator not ready, need to wait
+                            // dprintf(p"[s_recv_data] Allocator not ready. Transitioning to s_wait_alloc.\n")
+                            state                   := s_wait_alloc // Go to waiting state
+                        }
+                        // Reset counters regardless of next state
+                        dmaWordCount            := 0.U
+                        dmaIssueCount           := 0.U
                     }
-                    // Reset counters regardless of next state
-                    dmaWordCount            := 0.U
-                    dmaIssueCount           := 0.U
                     receivedDataWordCount   := 0.U
 
                     // Conditional debug print
@@ -787,8 +858,12 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
 
     .elsewhen(state === s_wait_write) {
-        // All Puts issued; complete when the last ack retires.
-        when(writeAckFire && dmaWordCount === (WORDS_PER_CHUNK - 1).U) {
+        // All Puts issued; complete when the last ack retires. Level test, not an edge on the
+        // final ack: a packet whose tail runs past WORDS_PER_CHUNK issues no Puts while it
+        // drains, so write-through can retire every ack before this state is entered and an edge
+        // test would sit here forever. Unchanged for the s_dma_write path, which always arrives
+        // with the last ack still in flight.
+        when(Mux(writeAckFire, dmaWordCount + 1.U, dmaWordCount) >= WORDS_PER_CHUNK.U) {
                 when(isStoringIncomingData) {
                     // The chunk data is now officially in memory.
                     // THIS is the correct place to set the arrived flag.
@@ -1320,7 +1395,13 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // --- Input Ready Logic ---
     val memoryHasSpace = numFreeBlocks > 0.U
     val stateAcceptsIn = state === s_idle || state === s_recv_meta2 || state === s_recv_data
-    io.in.ready     := stateAcceptsIn && memoryHasSpace
+    // Under write-through the A channel replaces the pool test in the join: the chunk already
+    // owns its block, and tl.a.ready / wtIssueAllowed are both self-clearing, so neither can
+    // wedge the receive the way an empty pool would. Past WORDS_PER_CHUNK no Put issues, so the
+    // A channel drops out and the tail still drains.
+    io.in.ready     := stateAcceptsIn && Mux(writeThroughActive,
+                                             !wtInChunk || (tl.a.ready && wtIssueAllowed),
+                                             memoryHasSpace)
 
     // --- Stats accounting: cycle buckets, block residency, backpressure, summary print ---
     // Runs every cycle; statReset has priority.
@@ -1368,7 +1449,9 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
             }
             // Backpressure toward the NIC, split by cause: memory exhaustion deasserts io.in.ready
             // without stalling the FSM, so no cycle bucket above can see it.
-            when(io.in.valid && !memoryHasSpace)   { cnt_in_stall_mem   := cnt_in_stall_mem   + 1.U }
+            // An armed chunk owns its block and is accepted regardless of the pool, so those
+            // cycles are not a refusal.
+            when(io.in.valid && !memoryHasSpace && !writeThroughActive) { cnt_in_stall_mem := cnt_in_stall_mem + 1.U }
             when(io.in.valid && !stateAcceptsIn)   { cnt_in_stall_state := cnt_in_stall_state + 1.U }
 
             // Peak concurrent residency. Pins to NUM_MEM_BLOCKS whenever the pool fully empties,
