@@ -996,7 +996,11 @@ class RecursiveDoublingWithDMAWrapper(implicit p: Parameters) extends LazyModule
   val ramSpanBytes = rdParams.numMemoryBlocks.toLong * rdParams.bytesPerChunk
   val ram = LazyModule(new TLRAM(
     address     = AddressSet(rdParams.baseMemoryAddr, ramSpanBytes - 1),
-    beatBytes   = 8, // 8-byte transfers to match NET_IF_BYTES for efficient network data handling
+    // Derived, not literal, so the RAM's beat and the accelerator's DMA geometry cannot drift:
+    // memBytesPerBeat also sets tl.a.bits.size and the address stride on the client side.
+    // Decoupled from NET_IF_BYTES on purpose -- the DMA packs beats out of the element buffers,
+    // so it is free to be wider than the 8-byte network word.
+    beatBytes   = rdParams.memBytesPerBeat,
     devName     = Some("recursive-doubling-dma-ram")
   ))
 

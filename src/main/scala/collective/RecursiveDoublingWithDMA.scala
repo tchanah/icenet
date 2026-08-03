@@ -17,6 +17,10 @@ case class RecursiveDoublingWithDMAParams(
     DataElements: Int       = 256,          // Number of data elements per packet
     BytesPerElement: Int    = 4,            // Size of each data element
     dataWidth: Int          = 64,           // Width of the streaming interface in bits
+    memWidth: Int           = 128,          // Width of the TileLink DMA interface in bits. Deliberately
+                                            // decoupled from dataWidth: the DMA packs beats out of the
+                                            // element buffers, not out of the network stream, so it is
+                                            // free to be wider than the 64-bit io.in/io.out.
     baseMemoryAddr: BigInt  = 0x80000000L,  // Base address for DMA operations
     sourceIds: Int          = 256,          // Number of TileLink source IDs for concurrent transactions
     MaxChunks: Int          = 1024,         // Maximum number of logical chunks
@@ -40,6 +44,20 @@ case class RecursiveDoublingWithDMAParams(
     require(DataElements % bytesPerWord == 0, "For simplicity, assuming DataElements is a multiple of bytesPerWord")
     val elementsPerWord: Int        = bytesPerWord / BytesPerElement
 
+    // DMA beat geometry. Held separate from the network-word geometry above on purpose:
+    // bytesPerWord / elementsPerWord also drive io.in and io.out and must stay at the network
+    // width, so the DMA sites use the mem* names and nothing else does.
+    require(memWidth % 8 == 0, "memWidth must be a multiple of 8.")
+    val memBytesPerBeat: Int        = memWidth / 8
+    // Power of 2 is load-bearing twice over, and both failures are silent rather than elaboration
+    // errors: the DMA address stride is emitted as a shift by log2Ceil(memBytesPerBeat), and
+    // wtWordInBeat slices the low bits of the word counter as a modulo. Either would quietly
+    // address the wrong block at, say, memWidth = 96. wordsPerBeat is then a power of 2 too.
+    require(isPow2(memBytesPerBeat), "memBytesPerBeat must be a power of 2.")
+    require(memBytesPerBeat % BytesPerElement == 0,
+        "memBytesPerBeat must be a whole number of elements.")
+    val memElementsPerBeat: Int     = memBytesPerBeat / BytesPerElement
+
     // Width required for counters
     val wordCountBits: Int          = log2Ceil(totalWordsPerPacket + 1)
     val levelCountBits: Int         = log2Ceil(Levels + 1)
@@ -48,6 +66,14 @@ case class RecursiveDoublingWithDMAParams(
     // Memory layout: Each level gets a contiguous block, with space for chunked data
     val bytesPerChunk: Int          = DataElements * BytesPerElement  // 1KB per chunk
     val wordsPerChunk: Int          = (bytesPerChunk + bytesPerWord - 1) / bytesPerWord // Round up
+    require(bytesPerChunk % memBytesPerBeat == 0,
+        "bytesPerChunk must be a whole number of DMA beats.")
+    val memBeatsPerChunk: Int       = bytesPerChunk / memBytesPerBeat
+    // Write-through stages arriving network words until a full beat is ready, so a beat must be a
+    // whole number of them. wordsPerBeat == 1 collapses back to the pre-widening 1-word-1-Put case.
+    require(memBytesPerBeat % bytesPerWord == 0,
+        "memBytesPerBeat must be a whole number of network words for receive write-through.")
+    val wordsPerBeat: Int           = memBytesPerBeat / bytesPerWord
     val maxBytesPerLevel: Int       = MaxChunks * bytesPerChunk  // Up to 1MB per level
     val maxWordsPerLevel: Int       = (maxBytesPerLevel + bytesPerWord - 1) / bytesPerWord
     
@@ -170,14 +196,20 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     }
 
     // --- Constants ---
-    val BYTES_PER_WORD          = outer.params.bytesPerWord
     val ELEMENTS_PER_WORD       = outer.params.elementsPerWord
     val NUM_DATA_ELEMENTS       = outer.params.DataElements
     val MAX_RECURSION_LEVEL     = outer.params.Levels
     val NUM_DATA_WORDS          = outer.params.numDataWords
     val ELEMENT_WIDTH           = outer.params.elementWidth
-    val WORDS_PER_CHUNK         = outer.params.wordsPerChunk
     val BYTES_PER_CHUNK         = outer.params.bytesPerChunk
+    // DMA-side geometry. Only the s_dma_*/s_wait_* states and the receive write-through use these;
+    // the network pack/unpack in s_recv_data and s_send_data stays on ELEMENTS_PER_WORD.
+    // BYTES_PER_WORD / WORDS_PER_CHUNK are deliberately gone: every former use was a DMA site, and
+    // leaving them beside the MEM_* names would invite re-coupling the two geometries.
+    val MEM_BYTES_PER_BEAT      = outer.params.memBytesPerBeat
+    val MEM_ELEMENTS_PER_BEAT   = outer.params.memElementsPerBeat
+    val MEM_BEATS_PER_CHUNK     = outer.params.memBeatsPerChunk
+    val WORDS_PER_BEAT          = outer.params.wordsPerBeat
     val MAX_CHUNKS              = outer.params.MaxChunks
     val CHUNK_INDEX_BITS        = outer.params.chunkIndexBits
     val MAX_BYTES_PER_LEVEL     = outer.params.maxBytesPerLevel
@@ -324,14 +356,24 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     // Write-through: armed in s_recv_meta2 at level > 0 when a block is already latched, so
     // s_recv_data Puts each word as it lands instead of paying a separate s_dma_write pass.
     val writeThroughActive      = RegInit(false.B)
-    // Gates tl.a.valid; io.in.ready adds tl.a.ready on top, joining the two handshakes.
+    // Gates tl.a.valid; on the word that completes a beat io.in.ready adds tl.a.ready on top,
+    // joining the two handshakes. Earlier words of a beat are accepted without the A channel.
     // Excludes numFreeBlocks on purpose: the block is already claimed, and testing the pool here
     // would deassert io.in.ready mid-chunk with nothing left running that could free a block.
     val wtIssueAllowed          = (dmaIssueCount - dmaWordCount) < MAX_DMA_XACTS.U
-    // A packet may carry more than WORDS_PER_CHUNK data words -- s_recv_data guards its buffer
+    // A packet may carry more than NUM_DATA_WORDS data words -- s_recv_data guards its buffer
     // writes with < NUM_DATA_ELEMENTS for exactly that. s_dma_write was immune; write-through
     // must drop the tail or it runs past the block into its neighbour.
-    val wtInChunk               = dmaIssueCount < WORDS_PER_CHUNK.U
+    // Counted in NETWORK words, not beats: once a beat spans several arriving words the two
+    // counters no longer advance in lockstep, and it is the arrivals that must be gated.
+    val wtInChunk               = receivedDataWordCount < NUM_DATA_WORDS.U
+    // Staging for a wide beat: WORDS_PER_BEAT arriving words are collected before one Put issues.
+    // wtWordInBeat is the position of the arriving word within the beat; the last position is the
+    // only one that issues, and it supplies the top slice directly rather than via the register.
+    val wtWordInBeat            = if (WORDS_PER_BEAT == 1) 0.U
+                                  else receivedDataWordCount(log2Ceil(WORDS_PER_BEAT) - 1, 0)
+    val wtBeatLastWord          = wtWordInBeat === (WORDS_PER_BEAT - 1).U
+    val wtStage                 = Reg(Vec(WORDS_PER_BEAT, UInt(outer.params.dataWidth.W)))
 
     // Default control signals
     nextLevel := currentLevelReg + 1.U
@@ -384,8 +426,8 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
     when(readAckFire) {
         val retiredWord = tl.d.bits.data
-        for (i <- 0 until ELEMENTS_PER_WORD) {
-            val elementIndex = readWordCount * ELEMENTS_PER_WORD.U + i.U
+        for (i <- 0 until MEM_ELEMENTS_PER_BEAT) {
+            val elementIndex = readWordCount * MEM_ELEMENTS_PER_BEAT.U + i.U
             when(elementIndex < NUM_DATA_ELEMENTS.U) {
                 val extractedData = retiredWord((i + 1) * ELEMENT_WIDTH - 1, i * ELEMENT_WIDTH)
                 when(isReadingInputData) {
@@ -643,20 +685,37 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         // }
         io.out.valid        := false.B
 
-        // Write-through: the arriving word goes to TLRAM in the same cycle it is buffered.
-        // While wtInChunk holds, io.in.ready carries tl.a.ready, so incoming_fire and tl.a.fire
-        // are the same event -- a word can never be consumed without being written.
+        // Write-through: arriving words go to TLRAM as they are buffered, one Put per beat.
+        // A beat spans WORDS_PER_BEAT arrivals, so tl.a.fire is no longer the same event as
+        // incoming_fire -- only the last word of a beat carries the A-channel handshake. The
+        // invariant it replaces: a beat's worth of words can never be consumed without that beat
+        // being written, because the earlier words sit in wtStage until the Put that drains them.
+        // A packet ending mid-beat would strand that partial beat and leave dmaWordCount short of
+        // MEM_BEATS_PER_CHUNK; payload is a fixed 1024 B in every format, so the in-chunk word
+        // count is always whole. (A short packet already wedges s_wait_write the same way.)
         when(writeThroughActive) {
-            tl.a.valid          := incoming_valid && wtIssueAllowed && wtInChunk
+            tl.a.valid          := incoming_valid && wtBeatLastWord && wtIssueAllowed && wtInChunk
             tl.a.bits.opcode    := TLMessages.PutFullData
             tl.a.bits.param     := 0.U
-            tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
+            tl.a.bits.size      := log2Ceil(MEM_BYTES_PER_BEAT).U
             tl.a.bits.source    := dmaIssueCount(SRC_BITS-1, 0)
 
             val wtBaseAddr      = outer.params.baseMemoryAddr.U + (blockIndexToWriteReg << log2Ceil(BYTES_PER_CHUNK).U)
-            tl.a.bits.address   := wtBaseAddr + (dmaIssueCount << log2Ceil(BYTES_PER_WORD).U)
-            tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
-            tl.a.bits.data      := incoming_bits.data
+            tl.a.bits.address   := wtBaseAddr + (dmaIssueCount << log2Ceil(MEM_BYTES_PER_BEAT).U)
+            tl.a.bits.mask      := (~0.U(MEM_BYTES_PER_BEAT.W))
+
+            // The beat is the staged words plus the one arriving this cycle. The final word is
+            // taken straight off the wire, so wtStage only ever holds the earlier WORDS_PER_BEAT-1.
+            val wtBeatVec       = Wire(Vec(WORDS_PER_BEAT, UInt(outer.params.dataWidth.W)))
+            for (i <- 0 until WORDS_PER_BEAT - 1) { wtBeatVec(i) := wtStage(i) }
+            wtBeatVec(WORDS_PER_BEAT - 1) := incoming_bits.data
+            tl.a.bits.data      := Cat(wtBeatVec.reverse)
+
+            // Stage the non-final words. Guarded by incoming_fire, so a word is only ever staged
+            // in the cycle it is actually consumed.
+            when(incoming_fire && !wtBeatLastWord && wtInChunk) {
+                wtStage(wtWordInBeat) := incoming_bits.data
+            }
 
             when(tl.a.fire) {
                 when(dmaIssueCount === 0.U) {
@@ -765,23 +824,23 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     .elsewhen(state === s_dma_write) {
         // Write data to memory, issuing back-to-back up to the outstanding limit.
         val writeOutstanding = dmaIssueCount - dmaWordCount
-        when(dmaIssueCount < WORDS_PER_CHUNK.U && writeOutstanding < MAX_DMA_XACTS.U) {
+        when(dmaIssueCount < MEM_BEATS_PER_CHUNK.U && writeOutstanding < MAX_DMA_XACTS.U) {
             tl.a.valid          := true.B
             tl.a.bits.opcode    := TLMessages.PutFullData
             tl.a.bits.param     := 0.U
-            tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
+            tl.a.bits.size      := log2Ceil(MEM_BYTES_PER_BEAT).U
             tl.a.bits.source    := dmaIssueCount(SRC_BITS-1, 0)
 
             // Calculate address dynamically based on the first available free block
             val baseAddr = outer.params.baseMemoryAddr.U + (blockIndexToWriteReg << log2Ceil(BYTES_PER_CHUNK).U)
-            tl.a.bits.address   := baseAddr + (dmaIssueCount << log2Ceil(BYTES_PER_WORD).U)
-            tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
+            tl.a.bits.address   := baseAddr + (dmaIssueCount << log2Ceil(MEM_BYTES_PER_BEAT).U)
+            tl.a.bits.mask      := (~0.U(MEM_BYTES_PER_BEAT.W))
 
-            val baseElementIndex = dmaIssueCount * ELEMENTS_PER_WORD.U
-            val dataWord        = Wire(UInt(outer.params.dataWidth.W))
+            val baseElementIndex = dmaIssueCount * MEM_ELEMENTS_PER_BEAT.U
+            val dataWord        = Wire(UInt(outer.params.memWidth.W))
             val dataSource      = Mux(isStoringIncomingData, incomingDataBuffer, processedDataBuffer)
-            val dataVec         = Wire(Vec(ELEMENTS_PER_WORD, UInt(ELEMENT_WIDTH.W)))
-            for (i <- 0 until ELEMENTS_PER_WORD) {
+            val dataVec         = Wire(Vec(MEM_ELEMENTS_PER_BEAT, UInt(ELEMENT_WIDTH.W)))
+            for (i <- 0 until MEM_ELEMENTS_PER_BEAT) {
                 dataVec(i) := Mux((baseElementIndex + i.U) < NUM_DATA_ELEMENTS.U, dataSource(baseElementIndex + i.U), 0.U)
             }
             dataWord            := Cat(dataVec.reverse)
@@ -850,7 +909,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 // }
                 
                 dmaIssueCount   := dmaIssueCount + 1.U
-                when(dmaIssueCount === (WORDS_PER_CHUNK - 1).U) {
+                when(dmaIssueCount === (MEM_BEATS_PER_CHUNK - 1).U) {
                     state       := s_wait_write   // last issued; drain acks there
                 }
             }
@@ -859,11 +918,11 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
     .elsewhen(state === s_wait_write) {
         // All Puts issued; complete when the last ack retires. Level test, not an edge on the
-        // final ack: a packet whose tail runs past WORDS_PER_CHUNK issues no Puts while it
+        // final ack: a packet whose tail runs past NUM_DATA_WORDS issues no Puts while it
         // drains, so write-through can retire every ack before this state is entered and an edge
         // test would sit here forever. Unchanged for the s_dma_write path, which always arrives
         // with the last ack still in flight.
-        when(Mux(writeAckFire, dmaWordCount + 1.U, dmaWordCount) >= WORDS_PER_CHUNK.U) {
+        when(Mux(writeAckFire, dmaWordCount + 1.U, dmaWordCount) >= MEM_BEATS_PER_CHUNK.U) {
                 when(isStoringIncomingData) {
                     // The chunk data is now officially in memory.
                     // THIS is the correct place to set the arrived flag.
@@ -915,18 +974,18 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
         // Read data from memory - address depends on what we're reading.
         // Issued back-to-back up to the outstanding limit.
         val readOutstanding = readReqCount - readWordCount
-        when(readReqCount < WORDS_PER_CHUNK.U && readOutstanding < MAX_DMA_XACTS.U) {
+        when(readReqCount < MEM_BEATS_PER_CHUNK.U && readOutstanding < MAX_DMA_XACTS.U) {
             tl.a.valid          := true.B
             tl.a.bits.opcode    := TLMessages.Get
             tl.a.bits.param     := 0.U
-            tl.a.bits.size      := log2Ceil(BYTES_PER_WORD).U
+            tl.a.bits.size      := log2Ceil(MEM_BYTES_PER_BEAT).U
             tl.a.bits.source    := readReqCount(SRC_BITS-1, 0)
             // Calculate the address from the base and block index
             val baseReadAddr = outer.params.baseMemoryAddr.U + (blockIndexInFlightReg << log2Ceil(BYTES_PER_CHUNK).U)
-            val readAddr = baseReadAddr + (readReqCount << log2Ceil(BYTES_PER_WORD).U)
-            
+            val readAddr = baseReadAddr + (readReqCount << log2Ceil(MEM_BYTES_PER_BEAT).U)
+
             tl.a.bits.address   := readAddr
-            tl.a.bits.mask      := (~0.U(BYTES_PER_WORD.W))
+            tl.a.bits.mask      := (~0.U(MEM_BYTES_PER_BEAT.W))
 
             when(tl.a.fire) {
                 // when(readReqCount === 0.U || readReqCount === (WORDS_PER_CHUNK.U - 1.U)) {
@@ -938,7 +997,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
                 // }
                 
                 readReqCount            := readReqCount + 1.U
-                when(readReqCount === (WORDS_PER_CHUNK - 1).U) {
+                when(readReqCount === (MEM_BEATS_PER_CHUNK - 1).U) {
                     // Last request issued; drain the outstanding responses in s_wait_read.
                     state               := s_wait_read
                 }
@@ -948,7 +1007,7 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
 
     .elsewhen(state === s_wait_read) {
         // All Gets issued; complete when the last response retires.
-        when(readAckFire && readWordCount === (WORDS_PER_CHUNK - 1).U) {
+        when(readAckFire && readWordCount === (MEM_BEATS_PER_CHUNK - 1).U) {
             // Read phase complete. The data is now in internal buffers, so we can free the memory block.
             // The block index was latched during the read request. Use the registered value.
             {
@@ -1397,10 +1456,14 @@ class RecursiveDoublingWithDMAModuleImp(outer: RecursiveDoublingWithDMA) extends
     val stateAcceptsIn = state === s_idle || state === s_recv_meta2 || state === s_recv_data
     // Under write-through the A channel replaces the pool test in the join: the chunk already
     // owns its block, and tl.a.ready / wtIssueAllowed are both self-clearing, so neither can
-    // wedge the receive the way an empty pool would. Past WORDS_PER_CHUNK no Put issues, so the
+    // wedge the receive the way an empty pool would. Past NUM_DATA_WORDS no Put issues, so the
     // A channel drops out and the tail still drains.
+    // Only the word that completes a beat joins on the A channel; the earlier words of the beat
+    // are accepted unconditionally into wtStage, which is what lets a wide Put fire once per
+    // WORDS_PER_BEAT arrivals instead of stalling receive to the DMA's rate.
     io.in.ready     := stateAcceptsIn && Mux(writeThroughActive,
-                                             !wtInChunk || (tl.a.ready && wtIssueAllowed),
+                                             !wtInChunk || !wtBeatLastWord ||
+                                                 (tl.a.ready && wtIssueAllowed),
                                              memoryHasSpace)
 
     // --- Stats accounting: cycle buckets, block residency, backpressure, summary print ---
@@ -1484,6 +1547,7 @@ class WithRecursiveDoublingWithDMA(
     maxLevel: Int           = 4,
     numElements: Int        = 256,
     numBytesPerElement: Int = 4,
+    memWidth: Int           = 128,
     baseAddr: BigInt        = 0x80000000L,
     sourceIds: Int          = 8,
     maxChunks: Int          = 1024,
@@ -1496,6 +1560,7 @@ class WithRecursiveDoublingWithDMA(
         DataElements        = numElements,
         BytesPerElement     = numBytesPerElement,
         dataWidth           = IceNetConsts.NET_IF_WIDTH,
+        memWidth            = memWidth,
         baseMemoryAddr      = baseAddr,
         sourceIds           = sourceIds,
         MaxChunks           = maxChunks,
