@@ -1450,7 +1450,7 @@ object RecursiveDoublingWithDMAConnector {
     // ========================================================================================
     // Buffering: NIC/SimNetwork outputs are Valid (no backpressure). We must buffer them.
     // Queue size to handle packet bursts during processing (~4 packets worth)
-    val localCpuQueue     = Module(new Queue(chiselTypeOf(netio.out.bits), 16000))
+    val localCpuQueue     = Module(new Queue(chiselTypeOf(netio.out.bits), 260))
     localCpuQueue.io.enq.valid := netio.out.valid
     localCpuQueue.io.enq.bits  := netio.out.bits
     netio.out.ready       := localCpuQueue.io.enq.ready  // Backpressure to NIC core
